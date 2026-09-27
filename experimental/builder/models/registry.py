@@ -540,7 +540,9 @@ FAMILIES: Tuple[ModelFamily, ...] = (
         "alpamayo",
         {
             "alpamayo_r1": _set(Component.LLM, Component.VISUAL,
-                                Component.ACTION)
+                                Component.ACTION),
+            "alpamayo1_5": _set(Component.LLM, Component.VISUAL,
+                                Component.ACTION),
         },
         {
             Component.LLM:

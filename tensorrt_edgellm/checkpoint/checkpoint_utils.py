@@ -257,7 +257,7 @@ def load_checkpoint_config_dicts(
     # Alpamayo-R1: flat config with no embedded VLM sub-config.
     # Load the full VLM architecture config from vlm_name_or_path and promote
     # the text sub-config so downstream sees a standard Qwen3-VL text config.
-    if root.get("model_type") == "alpamayo_r1":
+    if root.get("model_type") in ("alpamayo_r1", "alpamayo1_5"):
         llm = _promote_alpamayo_llm_config(root)
     else:
         llm = _promote_llm_subconfig(config, root)
@@ -1145,7 +1145,7 @@ def write_runtime_artifacts(model: "CausalLM",
     # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
     # Build it first so that tokenizer files exist before the copy loop
     # (which is a no-op for Alpamayo) and before process_chat_template.
-    if root_cfg.get("model_type") == "alpamayo_r1":
+    if root_cfg.get("model_type") in ("alpamayo_r1", "alpamayo1_5"):
         _build_alpamayo_tokenizer(root_cfg, out_dir)
 
     for fname in RUNTIME_TOKENIZER_FILENAMES:

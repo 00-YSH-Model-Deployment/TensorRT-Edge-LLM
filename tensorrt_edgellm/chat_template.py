@@ -86,7 +86,7 @@ def _is_vlm(model_dir: str) -> bool:
 
 def _is_alpamayo_1_model(model_dir: str) -> bool:
     root = _load_root_config(model_dir)
-    return root.get("model_type") == "alpamayo_r1"
+    return root.get("model_type") in ("alpamayo_r1", "alpamayo1_5")
 
 
 def _is_phi4mm_model(model_dir: str) -> bool:

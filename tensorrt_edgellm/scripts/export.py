@@ -122,6 +122,7 @@ _VLM_MODEL_TYPES = frozenset([
     "gemma4",
     "gemma4_unified",
     "alpamayo_r1",
+    "alpamayo1_5",
     *_NEMOTRON_OMNI_MODEL_TYPES,
 ])
 
@@ -161,6 +162,7 @@ _CODE2WAV_MODEL_TYPES = frozenset([
 
 _ACTION_MODEL_TYPES = frozenset([
     "alpamayo_r1",
+    "alpamayo1_5",
 ])
 # Which LLM-family components each model ships.  Default (unlisted model types)
 # is ``{"thinker"}``.  Add a new Talker/CP-bearing model by listing it here; no
@@ -225,7 +227,7 @@ def _has_llm_component(model_type: str, component: str) -> bool:
 
 
 def _is_alpamayo(model_type: str) -> bool:
-    return model_type == "alpamayo_r1"
+    return model_type in ("alpamayo_r1", "alpamayo1_5")
 
 
 def _is_diffusion_gemma(model_type: str, config: dict) -> bool:
@@ -1011,7 +1013,7 @@ def _export_llm(model_dir: str,
     os.makedirs(llm_out_dir, exist_ok=True)
 
     key_remap = None
-    if model_type == "alpamayo_r1":
+    if _is_alpamayo(model_type):
         key_remap = _alpamayo_llm_key_remap
     elif model_type == "cosmos3_edge":
         key_remap = _cosmos3_edge_llm_key_remap
