@@ -27,6 +27,50 @@
 
 - venv 는 레포 안 `.venv` (gitignore 됨). Python 3.12, torch `2.13.0+cpu` (pytorch CPU index), `pip install -e ".[export]"` → transformers 5.14.1, onnx 1.19.0.
 - **`uv pip` 에는 반드시 `--no-config`.** uv 는 `[tool.uv]` 가 없는 pyproject 를 건너뛰고 상위로 올라가 부모 `flashdrive/pyproject.toml` 의 `override-dependencies = ["torch==2.9.1"]` 를 적용한다. 처음엔 이것 때문에 `torch==2.13.0` 을 요청했는데 2.9.1 이 설치됐다.
+- **`.[export]` 만으로는 Alpamayo export 가 안 된다. `.[export,tools]` 로 설치해야 한다.** 1차 시도에서 두 곳이 깨졌다.
+  - tokenizer 빌드가 `Qwen2VLImageProcessor` 를 쓰는데 pillow / torchvision 이 없어 실패 → WARNING 만 찍고 넘어가서 tokenizer 파일이 안 생기고 chat template 이 fallback 으로 떨어짐 (`<|image_pad|>` token ID 못 찾음). **조용히 넘어가므로 로그에서 `Failed to build Alpamayo tokenizer` 를 반드시 확인.**
+  - visual export 가 `tensorrt_edgellm.quantization` 을 import → modelopt / requests / datasets 등 tools 스택 전체가 필요 (`ModuleNotFoundError: modelopt`).
+  - 1차 로그는 `/home/Humble/extra2/trt/alpamayo1_5_edgellm/export.attempt1.log`. LLM ONNX 는 1차에서도 7분 (16:58→17:05) 에 16GB 로 완료됐었다.
 - `pip install -e .` 는 `EDGELLM_PYTHON_ONLY_WHEEL=ON` 이라 CUDA/컴파일러 없이 된다. 단 `license-files` 검사 때문에 `git submodule update --init --recursive` 가 먼저 필요하다 (googletest / nlohmannJson / NVTX, 핀 리비전 그대로).
 - 검증. 1.5 snapshot 으로 `_is_alpamayo`, `_VLM_MODEL_TYPES`, `_ACTION_MODEL_TYPES`, `_is_alpamayo_1_model`, registry components (LLM/VISUAL/ACTION) 모두 인식. `load_checkpoint_config_dicts` 가 Cosmos-Reason2-8B 에서 `qwen3_vl_text` (hidden 4096, 36 layer, 32/8 head, head_dim 128, FFN 12288) 를 끌어오고 vocab 을 155697 로 덮어씀. `AutoConfig` 실패 경고는 R1 과 같은 raw config fallback 경로라 정상.
 - 단위 테스트 (`LLM_SDK_DIR=$PWD`) export_config / checkpoint_utils / chat_template_* / direct_builder_checkpoint_contract → 45 passed, 1 failed. 실패 1건은 `ModuleNotFoundError: tensorrt` (CPU venv 에 TRT Python 없음) 로 패치와 무관.
+
+## 2026-09-27 — export 2차 (성공 경로)
+
+- `processed_chat_template.json` 은 **이미 있으면 다시 만들지 않는다** (`checkpoint_utils.py` `write_runtime_artifacts` 끝부분 `if not os.path.exists(template_dst)`). 1차의 fallback (`User: / Assistant:`) 이 2차에도 그대로 남아 있었다. 같은 출력 디렉터리로 재실행할 땐 이 파일을 먼저 치울 것.
+  - 조치. stale 파일을 `/home/Humble/extra2/trt/alpamayo1_5_edgellm/processed_chat_template.attempt1_fallback.json` 로 옮기고 `process_chat_template(model_dir, out/llm)` 만 다시 호출. 결과는 Qwen `<|im_start|>` 형식 + `generation_prompt = "<|im_start|>assistant\n<|cot_start|>"` + image/video content type.
+  - `<|cot_start|>` 가 1.5 에도 맞다. upstream 1.5 `helper.create_message` (주행 추론) 는 `<|cot_start|>`, `<|answer_start|>` 는 `create_vqa_message` (VQA) 전용.
+- 소스 snapshot 기준 `Could not find token ID for '<|image_pad|>'` WARNING 은 정상 (1.5 snapshot 엔 tokenizer 가 없고 VLM 쪽에 있음). 출력 디렉터리 기준 경고가 없어야 정상.
+
+## 2026-09-27 — export 결과와 구조 검증
+
+- 명령 (CPU, `CUDA_VISIBLE_DEVICES=""`, `OMP_NUM_THREADS=16`, `HF_HUB_OFFLINE=1`, `HF_HOME=/home/Humble/extra2/Model`).
+  `tensorrt-edgellm-export <1.5 snapshot 7aba829> /home/Humble/extra2/trt/alpamayo1_5_edgellm/onnx --max-kv-cache-capacity 4096`
+- 소요 약 9분 (17:07 → 17:16, LLM 7분 / visual 20초 / action 2분). exit 0, traceback 0.
+- 산출물 (`/home/Humble/extra2/trt/alpamayo1_5_edgellm/onnx`, 로그 `../export.log`).
+
+  | 구성 | ONNX 외부 가중치 | 추가 파일 | 비고 |
+  |---|---|---|---|
+  | llm | 15.17 GB | embedding 1.28 GB, tokenizer (155697), chat template | qwen3_vl_text 36L, 36× AttentionPlugin |
+  | visual | 1.16 GB | preprocessor_config | qwen3_vl vision 27L, deepstack 3 |
+  | action | 4.56 GB | config (kv capacity 4096) | 36L expert 1 step, trt::Attention/RotaryEmbedding/TensorScatter |
+
+  action 크기는 DL4AGX head 엔진 (4.57 GB, A100 FP16) 과 일치.
+- 구조 검증. 세 ONNX 모두 `onnx.checker.check_model` 통과. action I/O 이름이 `cpp/common/bindingNames.h` 와 일치. `traj_token_start = 151669 + 3000 = 154669` (history delta tokenizer 1000 bin), `traj_vocab_size 4000` 과 정합.
+- **수치 검증은 못 했다.** 세 모델 모두 TRT 전용 커스텀 op 를 써서 onnxruntime 으로 실행 불가. AGENTS.md 도 "export 만으로는 모델 동작 증거가 아니다, export → build → inference 까지" 라고 명시. 다음 GPU 단계에서 PyTorch 대비 paired minADE 로 확인해야 한다.
+
+## GPU 요구사항 (export 산출물 크기 기반, 엔진 빌드/추론은 미실측)
+
+FP16 가중치 합계 = 15.17 + 1.28 + 1.16 + 4.56 ≈ **22.2 GB**. KV cache 4096 tok × 36 L × 8 kv head × 128 × K,V × 2 B ≈ 0.6 GB / 시퀀스 (batch 6 이면 3.6 GB).
+
+| 작업 | GPU | VRAM | 비고 |
+|---|---|---|---|
+| ONNX export | 불필요 | — | 완료 (CPU, RAM 약 32 GB 이상) |
+| 엔진 빌드 | sm_80+ (Ampere 이상) | **40 GB 이상 권장** | 빌드 피크 가중치의 1.5–2×. 엔진은 빌드한 GPU 아키텍처 + TRT 버전에서만 동작 |
+| 추론 FP16 (batch 1–6) | 빌드와 같은 GPU | **32 GB 이상** | 가중치 22 GB + KV 0.6–3.6 GB + 활성화 |
+| Thor 배포 | Jetson / DRIVE Thor | 통합 128 GB | Thor 에서 재빌드 필수 |
+
+- 적합 예. A100 40/80 GB, L40S 48 GB, RTX 6000 Ada 48 GB, RTX PRO 6000 96 GB, H100.
+- 24 GB 급 (RTX 4090 / 3090) 은 FP16 가중치만 22 GB 라 비권장. Alpamayo 는 FP16 only 라 양자화로 줄일 수도 없음.
+- 추가로 필요한 것. CUDA 12.8 toolkit (nvcc), TensorRT 10.x dev, `kernelSrcs/build_cutedsl.py --gpu_arch sm_80` (x86 sm_80 CuTe DSL 커널은 동봉 안 됨).
+- 현재 이 호스트 (2026-09-27 16:37 기준) 는 A100 3장 모두 다른 테넌트가 약 67 GB 사용 → 장당 여유 약 13 GB 라 불가.
