@@ -124,7 +124,7 @@ EOF
         --csv_out "$WORK_DIR/minade_results.csv" | tee "$WORK_DIR/minade_summary.txt"
 }
 
-[ $# -gt 0 ] || { sed -n 2,14p "$0"; exit 1; }
+[ $# -gt 0 ] || { sed -n '/^# Jetson Thor/,/^set -euo/{/^set -euo/!p}' "$0"; exit 1; }
 for stage in "$@"; do
     case "$stage" in
         all) stage_check; stage_build; stage_engines; stage_inputs; stage_infer; stage_score ;;
