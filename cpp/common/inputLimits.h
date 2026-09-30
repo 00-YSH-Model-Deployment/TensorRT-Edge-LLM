@@ -42,7 +42,9 @@ constexpr int kReasonableMaxBatchSize = 16;
 // Validation limits for message parsing.
 constexpr size_t kMaxMessageContentSizeBytes = 128 * 1024; // 128KB per content item
 constexpr size_t kMaxMessagesPerRequest = 64;
-constexpr size_t kMaxContentItemsPerMessage = 18;
+// Alpamayo 1.5 labels every image with a camera name and a frame index, so one user message
+// holds 4 + 16 + 16 + 2 = 38 items.
+constexpr size_t kMaxContentItemsPerMessage = 64;
 // Match vLLM's MAX_NUM_LOGIT_BIAS_TOKENS sparse logit-bias guardrail.
 constexpr size_t kMaxLogitBiasTokens = 1024;
 constexpr float kMinLogitBias = -100.0F;
