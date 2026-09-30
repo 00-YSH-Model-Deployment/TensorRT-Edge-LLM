@@ -74,3 +74,18 @@ FP16 가중치 합계 = 15.17 + 1.28 + 1.16 + 4.56 ≈ **22.2 GB**. KV cache 409
 - 24 GB 급 (RTX 4090 / 3090) 은 FP16 가중치만 22 GB 라 비권장. Alpamayo 는 FP16 only 라 양자화로 줄일 수도 없음.
 - 추가로 필요한 것. CUDA 12.8 toolkit (nvcc), TensorRT 10.x dev, `kernelSrcs/build_cutedsl.py --gpu_arch sm_80` (x86 sm_80 CuTe DSL 커널은 동봉 안 됨).
 - 현재 이 호스트 (2026-09-27 16:37 기준) 는 A100 3장 모두 다른 테넌트가 약 67 GB 사용 → 장당 여유 약 13 GB 라 불가.
+
+## 2026-09-30 — Thor 로 진행 결정과 실행 준비
+
+- **사용자 결정.** 엔진 빌드·추론은 Thor 에서 한다. A100 3장은 다른 테넌트가 장당 약 66 GB 를 쓰고 있어 여유가 약 15 GB 뿐이다. RTX 4090 (24 GB) 은 FP16 가중치만 22.2 GB 라 불가. 검증 규모는 gold644 전체.
+- 이 호스트 driver 는 580.126.09 (CUDA 13.0) 로 올라가 있다. 시스템 TensorRT 는 10.8.0.43 이라 action ONNX 를 못 읽는다.
+- **TensorRT 10.15 이상 필요.** action ONNX 는 `trt::RotaryEmbedding` ×72, `trt::TensorScatter` ×72, `trt::Attention` ×36 을 쓰고, schema 주석이 "consumed by TRT >= 10.15" 다 (`tensorrt_edgellm/onnx/onnx_custom_schemas.py`). `limitations.md` 에 JetPack 7.1 이 TRT 10.13.3.9 라고 적혀 있어, JetPack 7.0/7.1 Thor 에서는 action_build 가 실패할 수 있다. `check` 단계가 경고한다.
+- **`kMaxContentItemsPerMessage` 18 → 64.** 1.5 는 `helper._build_image_content` 가 카메라마다 `"{name}: "`, 프레임마다 `"frame {i} "` text 를 넣어 user 메시지가 4 + 16 + 16 + trajectory + text = 38 항목이다. R1 은 정확히 18 이었다. 상수만 바꿨고 이 호스트엔 툴체인이 없어 컴파일은 Thor 에서 처음 한다.
+- **이전 노트 정정 두 건.**
+  - min/max_pixels 는 문제가 아니다. C++ 런타임은 `preprocessor_config.json` 을 쓰지 않고 visual 엔진의 `--minImageTokens 160 --maxImageTokensPerImage 192` 로 크기를 정한다. 160·32² = 163840, 192·32² = 196608 로 upstream 과 같다. 1920×1080 은 320×576, 180 token 이 된다.
+  - `compute_minade.py` 의 정규화 상수는 1.5 에서도 그대로 맞다. 1.5 config 값을 bf16 으로 반올림하면 정확히 그 값이고, PyTorch 모델도 버퍼를 bf16 으로 캐스팅한다.
+- **clip 당 6 sample 은 한 배치로 묶어야 한다.** `initializeNoiseTrajectory` 가 배치마다 같은 seed 로 generator 를 새로 만든다. batch 1 로 6번 반복하면 6개가 같은 noise 를 받아 CoC 샘플링 차이만 남는다. 그래서 변환기는 같은 request 를 6번 연속으로 쓰고 `batch_size 6`, 엔진은 `--maxBatchSize 6` 이다. 모든 clip 이 같은 6개 noise 를 쓴다는 점은 남는다 (`--noiseSeed` 로만 바뀜).
+- **입력 파일을 나눈다.** `action_inference` 는 파싱 시점에 파일 안 모든 request 의 이미지를 메모리에 올린다 (같은 파일을 6번 읽어도 6번 올림). 1920×1080 RGB 16장 × 6 × 8 clip 이면 약 4.8 GB 라 기본 `--clips-per-file 8`. 파일마다 엔진을 다시 로드하므로 지연 측정은 파일 첫 배치를 빼고 봐야 한다.
+- 샘플링은 upstream 기본값에 맞춘다. temperature 0.6, top_p 0.98, top_k 0 (비활성, upstream 은 None), max_generate_length 256.
+- PyTorch 와는 noise 를 맞출 수 없어 (Edge-LLM 은 seed 만 받음) clip 별 1:1 이 아니라 분포 비교다.
+- 미확인 위험. action expert 가 쓰는 TRT 네이티브 Attention 레이어가 Thor TRT 버전에서 빌드되는지, batch 6 추론의 실제 메모리.

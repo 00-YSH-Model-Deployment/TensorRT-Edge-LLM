@@ -12,15 +12,25 @@
 - [x] ONNX 구조 검증 (llm / visual / action 존재, checker, action I/O 이름, kv capacity 4096)
 - [x] GPU 요구사항 표 확정
 
-## Phase 1 — A100 1장 (GPU 여유 ≥ 40GB + 사용자 허락 후)
+## Phase 0.5 — Thor 실행 준비 (CPU, 2026-09-30)
 
-- [ ] CUDA 12.8 toolkit (nvcc) 유저 공간 설치
+- [x] `kMaxContentItemsPerMessage` 18 → 64 (1.5 프롬프트는 user 메시지 항목 38개)
+- [x] 입력 변환기 `examples/accuracy/scripts/prepare_alpamayo1_5_inputs.py` (1 clip 스트리밍 시험, upstream `create_message` 와 user content 문자열 일치)
+- [x] Thor 단계 실행 스크립트 `scripts/run_alpamayo1_5_thor.sh` (score 단계만 가짜 출력으로 시험)
+
+## Phase 1 — Thor (2026-09-30 사용자 결정, A100 은 여유 없어 보류)
+
+- [ ] ONNX (`/home/Humble/extra2/trt/alpamayo1_5_edgellm/onnx`, 약 22 GB) 를 Thor 로 복사
+- [ ] `check` — JetPack 의 TensorRT 가 10.15 이상인지 (미만이면 action_build 실패 가능)
+- [ ] `build` — C++ 빌드 (sm_110 CuTe DSL prebuilt 동봉, 커널 빌드 불필요)
+- [ ] `engines` — llm / visual / action, maxBatchSize 6
+- [ ] `LIMIT=1` 스모크 → CoC 텍스트와 궤적이 그럴듯한지, visual token 이 이미지당 180 인지
+- [ ] `inputs` + `infer` + `score` — gold644 × 6 sample, minADE6
+- [ ] 같은 644 clip PyTorch 1.5 (`run_inference_tracked.py`) 와 분포 비교 + 지연
+
+## 보류 — A100 1장 (GPU 여유 ≥ 40GB + 사용자 허락 후)
+
+- [ ] CUDA toolkit (nvcc) 유저 공간 설치 + TensorRT 10.15 이상 tarball (시스템 TRT 는 10.8 이라 부족)
 - [ ] `kernelSrcs/build_cutedsl.py --gpu_arch sm_80`
 - [ ] C++ 빌드 (`-DCUTE_DSL_ARTIFACT_TAG=sm_80 -DENABLE_CUTE_DSL=ALL`)
 - [ ] `llm_build` / `visual_build` / `action_build`
-- [ ] visual token 수 PyTorch 대비 확인 (processor pixel 범위 R1 하드코딩 100352 / 2097152 vs upstream 163840 / 196608)
-- [ ] `action_inference` 로 PhysicalAI-AV 소수 clip, PyTorch 대비 paired minADE + 지연
-
-## Phase 2 — Thor
-
-- [ ] ONNX 복사 → Thor 에서 엔진 재빌드 + 추론
