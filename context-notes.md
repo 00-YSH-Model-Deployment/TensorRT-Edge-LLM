@@ -125,3 +125,21 @@ FP16 가중치 합계 = 15.17 + 1.28 + 1.16 + 4.56 ≈ **22.2 GB**. KV cache 409
   | 한 run 벽시계 | 약 2.1 s | 약 8.4–9.2 s | 3.52 s (vision 포함) |
 
 - 다음은 latency30 30 clip K=1 측정이다. clip 마다 이미지가 달라 vision 도 매번 돈다. PyTorch baseline2 와 같은 clip 이다.
+
+## 2026-10-01 — latency30 30 clip, K=1, TensorRT 11 (FP16)
+
+- 실행: `scripts/run_alpamayo1_5_k1_latency.sh`. clip 마다 요청 1개, batch 1 로 돌렸다. 파일마다 50 C 까지 식히고 같은 요청으로 3번 warmup 한 뒤 프로파일을 남겼다. 결과는 `00_Model/Alpamayo-1.5_EdgeLLM/lat30-trt11/`.
+- PyTorch baseline2 (6e22ab06) 와 같은 30 clip 이고, 둘 다 16 프레임 전체를 매번 처리한다.
+
+  | 단계 | TensorRT 11 (Edge-LLM) | PyTorch 1.5 baseline2 | 변화 |
+  |---|---|---|---|
+  | vision | 163 ms (26 run, 4 run 은 캐시 적중) | 549 ms | −70% |
+  | prefill | 702 ms | 1,064 ms | −34% |
+  | 디코드 step | 67.7 ms (요청당 15.9 step) | 69.6 ms (14.6 token) | −3% |
+  | action (궤적 헤드) | 353 ms | 682 ms | −48% |
+  | 요청 하나 벽시계 | **2,472 ms** (중앙값 2,416, p90 2,741) | 3,524 ms (입력→출력) | **1.43배** |
+
+- 벽시계는 로그의 run 시작 시각 간격이다. PNG 읽기와 전처리가 들어 있다.
+- 디코드는 FP16 가중치를 매 토큰 다시 읽는 대역폭 한계라 거의 그대로다. 줄이려면 양자화가 필요하다.
+- **정확도.** K=1 ADE@6.4s 는 TensorRT 2.045 m, PyTorch 2.265 m 다. 같은 clip 짝으로 −9.7% [−29.2, +9.7], 상관 0.83 이다. 노이즈 시드 방식이 달라 1:1 비교는 아니지만 나빠지지 않았다.
+- 참고. 같은 보드에서 FlashDrive(PyTorch: 스트리밍 + DFlash + 컴파일)는 한 clip 의 100 ms 창 기준으로 992 ms, W4A8 을 켜면 899 ms 였다(`13_Model-Optimization/flashdrive_thor_bench`). 측정 방식이 다르다. TensorRT 는 단계별 커널이 빠르고, FlashDrive 는 다시 계산할 양을 줄인다. 둘은 서로 보완한다.

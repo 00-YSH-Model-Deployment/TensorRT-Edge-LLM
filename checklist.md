@@ -27,6 +27,7 @@
 - [x] `LIMIT=1` 스모크 (clip 021a4585, 6 sample) → CoC 텍스트가 PyTorch 와 같은 문장, minADE6@6.4s 0.038 m. visual token 수는 미확인
 - [ ] `inputs` + `infer` + `score` — gold644 × 6 sample, minADE6
 - [ ] 같은 644 clip PyTorch 1.5 (`run_inference_tracked.py`) 와 분포 비교 + 지연
+- [x] latency30 30 clip K=1 지연·정확도 (TensorRT 11, 2026-10-01): 요청당 2,472 ms (PyTorch 3,524 ms 의 1.43배), ADE 차이는 잡음 범위
 
 ## 보류 — A100 1장 (GPU 여유 ≥ 40GB + 사용자 허락 후)
 
