@@ -143,3 +143,54 @@ FP16 가중치 합계 = 15.17 + 1.28 + 1.16 + 4.56 ≈ **22.2 GB**. KV cache 409
 - 디코드는 FP16 가중치를 매 토큰 다시 읽는 대역폭 한계라 거의 그대로다. 줄이려면 양자화가 필요하다.
 - **정확도.** K=1 ADE@6.4s 는 TensorRT 2.045 m, PyTorch 2.265 m 다. 같은 clip 짝으로 −9.7% [−29.2, +9.7], 상관 0.83 이다. 노이즈 시드 방식이 달라 1:1 비교는 아니지만 나빠지지 않았다.
 - 참고. 같은 보드에서 FlashDrive(PyTorch: 스트리밍 + DFlash + 컴파일)는 한 clip 의 100 ms 창 기준으로 992 ms, W4A8 을 켜면 899 ms 였다(`13_Model-Optimization/flashdrive_thor_bench`). 측정 방식이 다르다. TensorRT 는 단계별 커널이 빠르고, FlashDrive 는 다시 계산할 양을 줄인다. 둘은 서로 보완한다.
+
+## 2026-10-02 — FlashDrive 기법을 Edge-LLM(TensorRT)에 차례로 얹기
+
+FlashDrive(z-lab)의 기법 가운데 세 가지를 TensorRT 엔진 위로 옮겼다. 각 기법은 환경변수로 켠다.
+- **action 캐싱**: `EDGELLM_ALPAMAYO_DENOISE_STEPS=8 EDGELLM_ALPAMAYO_CACHE_STEPS=3,4,5,6`. 8스텝 가운데 4스텝은 action 엔진을 돌리지 않고 직전 속도를 재사용한다. z-lab action head 체크포인트로 만든 엔진(`zlab/engines`)이 필요하다.
+- **DFlash**: `EDGELLM_DFLASH_BLOCK=8 EDGELLM_DFLASH_CONTEXT_WINDOW=8`. z-lab `Alpamayo-1.5-10B-DFlash` 드래프트를 쓴다. base는 `--dflash-base`, 드래프트는 `--dflash-draft`로 export해 같은 엔진 폴더에 둔다.
+- **NVFP4**: `examples/accuracy/scripts/quantize_alpamayo1_5_llm.py`. ModelOpt로 언어모델 선형층 252개만 양자화하고, 보정은 평가 세트에 없는 학습 clip 64개로 한다. 비전, lm_head, action expert는 FP16으로 둔다.
+
+DFlash를 붙이며 고친 것:
+- **마스크 토큰**: id 155697이 base 어휘 끝 다음 칸이다. 그래서 export가 `mask_embedding.pt`의 행을 임베딩 표에 덧붙인다. 런타임 검사도 출력 어휘가 아니라 입력 임베딩 표 크기로 바꿨다.
+- **lm_head**: 드래프트는 base의 lm_head(`vlm.lm_head.weight`)를 빌려 쓴다.
+- **궤적 토큰**: 한 라운드에서 여러 토큰이 받아들여지면 `<|traj_future_start|>` 뒤까지 KV에 들어갈 수 있다. action head는 그 토큰까지만 읽어야 하므로 KV 길이와 토큰을 그 지점으로 잘라낸다.
+- **컨텍스트 창**: z-lab 드래프트는 직전 8개 은닉 상태와 로컬 위치 0..15로 학습됐다. 전체 캐시를 보게 하면 라운드당 1.07토큰밖에 받아들여지지 않는다. 마지막 8행만 매 라운드 위치 0..7에 다시 쓰면 3.7토큰이 된다.
+
+측정: `scripts/run_alpamayo1_5_flashdrive_ladder.sh`. latency30 30 clip, K=1이고, 파일마다 50 °C까지 식힌 뒤 약 60초 예열했다. 요약은 `scripts/summarize_alpamayo1_5_k1.py`로 했다. 벽시계는 26요청 기준이다(각 파일의 첫 요청은 인코더 캐시가 맞아 ViT를 건너뛰므로 뺐다). 결과는 `00_Model/Alpamayo-1.5_EdgeLLM/lat30w-*`.
+
+| 설정 | 요청당 벽시계 | fps | vision | prefill | 디코드 (forward 수) | action | ADE6.4 |
+|---|---|---|---|---|---|---|---|
+| PyTorch baseline2 | 3,524 ms | 0.28 | 549 | 1,064 | 69.6 ms × 14.6 | 682 | 2.265 |
+| TRT FP16, nvidia, 10스텝 | 2,550 | 0.39 | 160 | 780 | 1,048 (15.9) | 347 | 2.045 |
+| z-lab action head | 2,473 | 0.40 | 160 | 699 | 1,050 (15.9) | 351 | 1.989 |
+| + action 캐싱 (8스텝, 4개 재사용) | 2,266 | 0.44 | 160 | 696 | 1,050 (15.9) | **146** | 1.981 |
+| + greedy (DFlash 비교 기준) | 2,232 | 0.45 | 158 | 680 | 1,030 (15.9) | 148 | 1.981 |
+| + DFlash | 1,487 | 0.67 | 160 | 666 | **308 (4.2)** | 146 | 1.981 |
+| + NVFP4 | **831** | **1.20** | 158 | **202** | **128 (3.6)** | 148 | 1.917 |
+
+- **누적 효과**: 전부 켜면 PyTorch 대비 **4.2배**(3,524 → 831 ms), TRT FP16 대비 3.1배다.
+- **기법별 효과**:
+  - action 캐싱: −207 ms. action 단계가 351 → 146 ms로 줄었다.
+  - DFlash: −745 ms. 디코드 라운드가 15.9 → 4.2로 줄었다.
+  - NVFP4: −656 ms. prefill이 −70%, 검증 라운드가 63.6 → 24.6 ms로 줄었다.
+- **정확도**: ADE6.4 차이는 전부 신뢰구간 안이다.
+  - z-lab vs nvidia: −2.7% [−15.9, +10.3]
+  - 캐싱: −0.4% [−4.4, +4.5]
+  - DFlash vs greedy: +0.0% [−0.1, +0.1]
+  - NVFP4 vs FP16 DFlash: −3.2% [−8.1, +0.8]
+  - 샘플링(0.6/0.98)과 greedy는 30 clip 모두 같은 문장을 냈다. 그래서 DFlash가 greedy를 강제해도 손해가 없다.
+- **문장 차이**:
+  - DFlash는 greedy와 29/30 같았다. 다른 한 clip은 FP16 반올림으로 동점에 가까운 토큰이 뒤집힌 것이다.
+  - NVFP4는 FP16 DFlash와 26/30 같았다. 다른 문장도 장면 설명으로서 타당하다.
+- **10 fps 목표까지**: 남은 831 ms의 구성은 vision 158, prefill 202, 디코드 128, action 148, 나머지 약 195(전처리·동기화)다. 다음 레버는 다음과 같다.
+  - **프레임 스트리밍**: 새 프레임만 인코딩·prefill한다.
+  - **vision FP8**
+  - **action 엔진 양자화**
+- **측정 주의**:
+  - 같은 엔진에서도 prefill이 700–780 ms로 ±10% 흔들렸다(nv-s10 780, s10 699).
+  - 부하 중 GPU(1,575 MHz)와 메모리(4,266 MHz) 클럭은 3초 안에 최대로 올라가므로 원인은 클럭이 아니다.
+  - 앞서 3회 예열 실행에서 "캐싱인데 벽시계가 그대로"였던 것도 이 흔들림 때문이었다.
+- **인코더 임베딩 캐시**:
+  - 모든 이미지가 맞을 때만 ViT를 건너뛴다. 스트리밍에서는 16장 중 12장이 같으므로 부분 적중을 지원해야 이득이 난다.
+  - 캐시는 주 임베딩만 저장하고 deepstack 특징은 저장하지 않는다. 그래서 다른 이미지 세트 뒤에 적중하면 deepstack 버퍼에 이전 값이 남는다. 상류 버그로 보인다.
