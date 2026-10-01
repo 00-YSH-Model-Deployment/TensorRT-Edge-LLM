@@ -20,6 +20,8 @@
 #include "common/checkMacros.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 
 namespace trt_edgellm
 {
@@ -132,12 +134,40 @@ BlockHash finishHash(FnvValue state) noexcept
 
 Hash128 hashOpaqueIdentity(std::string_view bytes)
 {
+    // Media buffers run to tens of megabytes per request, too many for a 128-bit multiply per byte.
+    // The bulk goes through four 64-bit multiply-rotate lanes (xxHash64 rounds) over 32-byte stripes;
+    // the lanes, the length and the tail bytes then enter the FNV state like any other field.
+    constexpr uint64_t kPRIME1 = 0x9E3779B185EBCA87ULL;
+    constexpr uint64_t kPRIME2 = 0xC2B2AE3D27D4EB4FULL;
+    constexpr size_t kSTRIPE = 32U;
+    auto const round = [](uint64_t acc, uint64_t lane) noexcept {
+        acc += lane * kPRIME2;
+        acc = (acc << 31U) | (acc >> 33U);
+        return acc * kPRIME1;
+    };
+    std::array<uint64_t, 4> lanes{kPRIME1 + kPRIME2, kPRIME2, 0U, 0U - kPRIME1};
+    char const* const data = bytes.data();
+    size_t const stripes = bytes.size() / kSTRIPE;
+    for (size_t stripe = 0; stripe < stripes; ++stripe)
+    {
+        for (size_t lane = 0; lane < lanes.size(); ++lane)
+        {
+            uint64_t word;
+            std::memcpy(&word, data + stripe * kSTRIPE + lane * sizeof(word), sizeof(word));
+            lanes[lane] = round(lanes[lane], word);
+        }
+    }
+
     FnvValue state = kFNV_OFFSET;
     fnvTag(state, Tag::kOpaqueIdentity);
     fnvU64(state, static_cast<uint64_t>(bytes.size()));
-    for (char const value : bytes)
+    for (uint64_t const lane : lanes)
     {
-        fnvByte(state, static_cast<uint8_t>(value));
+        fnvU64(state, lane);
+    }
+    for (size_t index = stripes * kSTRIPE; index < bytes.size(); ++index)
+    {
+        fnvByte(state, static_cast<uint8_t>(data[index]));
     }
     return finishHash(state);
 }

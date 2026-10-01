@@ -17,6 +17,7 @@
 
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <filesystem>
 #include <forward_list>
@@ -418,6 +419,8 @@ protected:
 
     /**
      * @brief Partition text into special tokens and raw text segments using forward_list
+     *
+     * One left-to-right pass; where special tokens overlap, the longest one starting leftmost wins.
      * @param text Input text to partition
      * @param partitions Output forward_list of text partitions
      * @return true if text is partitioned successfully without exceptions;
@@ -444,6 +447,8 @@ protected:
     // Special token mappings for fast lookup
     TokenToRanks mSpecialTokensEncoder;                          //!< Special tokens encoder mapping
     std::unordered_map<Rank, std::string> mSpecialTokensDecoder; //!< Special tokens decoder mapping
+    std::vector<size_t> mSpecialTokenLengths;                    //!< Distinct special token lengths, longest first
+    std::array<bool, 256> mSpecialTokenFirstByte{};              //!< Bytes that can start a special token
 
     // Configuration
     int mNumVocab;                       //!< Total vocabulary size

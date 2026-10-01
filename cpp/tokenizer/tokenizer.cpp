@@ -21,6 +21,7 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizerUtils.h"
 #include <algorithm>
+#include <functional>
 #include <cctype>
 #include <fstream>
 #include <iterator>
@@ -91,6 +92,8 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir, bool requireCh
     mTokenEncoder.reset();
     mSpecialTokensEncoder.clear();
     mSpecialTokensDecoder.clear();
+    mSpecialTokenLengths.clear();
+    mSpecialTokenFirstByte.fill(false);
     mBosId = -1;
     mEosId = -1;
     mAdditionalEosIds.clear();
@@ -142,6 +145,17 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir, bool requireCh
     // Store special tokens for fast lookup
     mSpecialTokensEncoder = specialTokens;
     mSpecialTokensDecoder = reverseEncoder(mSpecialTokensEncoder);
+    for (auto const& entry : mSpecialTokensEncoder)
+    {
+        if (!entry.first.empty())
+        {
+            mSpecialTokenLengths.push_back(entry.first.size());
+            mSpecialTokenFirstByte[static_cast<uint8_t>(entry.first.front())] = true;
+        }
+    }
+    std::sort(mSpecialTokenLengths.begin(), mSpecialTokenLengths.end(), std::greater<size_t>());
+    mSpecialTokenLengths.erase(
+        std::unique(mSpecialTokenLengths.begin(), mSpecialTokenLengths.end()), mSpecialTokenLengths.end());
 
     mNumVocab = static_cast<int>(mTokenEncoder->getVocabSize());
 
@@ -757,72 +771,56 @@ bool Tokenizer::partitionSpecialTokens(
 {
     try
     {
-        for (auto const& [specialToken, specialId] : mSpecialTokensEncoder)
+        std::forward_list<textPartition> result;
+        auto tail = result.before_begin();
+        for (auto const& part : partitions)
         {
-            for (auto it = partitions.begin(); it != partitions.end(); ++it)
+            if (part.type != TEXT_PART_RAW_TEXT)
             {
-                auto& part = (*it);
-
-                // if part not yet processed
-                if (part.type == TEXT_PART_RAW_TEXT)
+                tail = result.insert_after(tail, part);
+                continue;
+            }
+            std::string const& raw = part.rawText;
+            size_t const end = static_cast<size_t>(part.offset + part.length);
+            size_t pending = static_cast<size_t>(part.offset);
+            size_t pos = pending;
+            while (pos < end)
+            {
+                size_t matchedLength = 0;
+                if (mSpecialTokenFirstByte[static_cast<uint8_t>(raw[pos])])
                 {
-                    auto& rawText = part.rawText;
-                    auto baseOffset = part.offset;
-                    auto baseLength = part.length;
-
-                    // find occurrences of specialToken in rawText
-                    while (true)
+                    for (size_t const length : mSpecialTokenLengths)
                     {
-                        auto match = rawText.find(specialToken, baseOffset);
-                        if ((match == std::string::npos)
-                            || (static_cast<int>(match + specialToken.length()) > (baseOffset + baseLength)))
+                        if (length > end - pos)
                         {
-                            break;
+                            continue;
                         }
-
-                        auto basePos = std::distance(partitions.begin(), it);
-
-                        // insert left part
-                        if (match > static_cast<size_t>(baseOffset))
+                        auto const hit = mSpecialTokensEncoder.find(raw.substr(pos, length));
+                        if (hit != mSpecialTokensEncoder.end())
                         {
-                            partitions.emplace_after(it, rawText, baseOffset, match - baseOffset);
-                            ++it;
-                        }
-
-                        // insert special token
-                        partitions.emplace_after(it, specialId);
-                        ++it;
-
-                        // remove original part
-                        if (basePos == 0)
-                        {
-                            partitions.erase_after(partitions.before_begin());
-                        }
-                        else
-                        {
-                            partitions.erase_after(std::next(partitions.begin(), (basePos - 1)));
-                        }
-
-                        // insert right part and continue loop
-                        if (match + specialToken.length() < static_cast<size_t>(baseOffset + baseLength))
-                        {
-                            int rightOffset = match + specialToken.length();
-                            int rightLength = baseLength + baseOffset - (match + specialToken.length());
-                            partitions.emplace_after(it, rawText, rightOffset, rightLength);
-                            ++it;
-
-                            baseOffset = rightOffset;
-                            baseLength = rightLength;
-                        }
-                        else
-                        {
+                            if (pos > pending)
+                            {
+                                tail = result.emplace_after(
+                                    tail, raw, static_cast<int>(pending), static_cast<int>(pos - pending));
+                            }
+                            tail = result.emplace_after(tail, hit->second);
+                            matchedLength = length;
                             break;
                         }
                     }
                 }
+                pos += matchedLength > 0 ? matchedLength : 1;
+                if (matchedLength > 0)
+                {
+                    pending = pos;
+                }
+            }
+            if (end > pending)
+            {
+                tail = result.emplace_after(tail, raw, static_cast<int>(pending), static_cast<int>(end - pending));
             }
         }
-
+        partitions = std::move(result);
         return true;
     }
     catch (std::exception const& e)
