@@ -35,6 +35,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderUtils.h"
 #include "runtime/decoding/dflashDecodeUtils.h"
+#include <cstdlib>
 #include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
@@ -93,6 +94,11 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     int32_t const maxBatch = deployment.maxRuntimeBatchSize();
 
     ELLM_CHECK(mDraftExecutor != nullptr, std::string(userModeName()) + " decoding requires a validated draft engine.");
+    int64_t const embeddingRows = mRuntime.preprocess.embedding.table.getShape()[0];
+    ELLM_CHECK(mBlockDraft.maskTokenId < embeddingRows,
+        std::string(userModeName()) + " mask_token_id (" + std::to_string(mBlockDraft.maskTokenId)
+            + ") has no row in the base embedding table (" + std::to_string(embeddingRows)
+            + " rows); re-export the base with --dflash-draft-dir to fold the draft's mask embedding.");
 
     mDraftInputsEmbeds = Tensor({maxBatch, mBlockDraft.blockSize, mBlockDraft.draftHiddenSize}, DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "DFlashDraft::inputsEmbeds");
@@ -100,6 +106,22 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         nvinfer1::DataType::kHALF, "DFlashDraft::targetHiddenScratch");
     mDraftOutputLogits = Tensor({maxBatch, mBlockDraft.blockSize, mBlockDraft.draftVocabSize}, DeviceType::kGPU,
         nvinfer1::DataType::kFLOAT, "DFlashDraft::outputLogits");
+
+    if (char const* window = std::getenv("EDGELLM_DFLASH_CONTEXT_WINDOW"))
+    {
+        mContextWindow = std::atoi(window);
+    }
+    ELLM_CHECK(mContextWindow >= 0 && mContextWindow <= mBlockDraft.blockSize,
+        "EDGELLM_DFLASH_CONTEXT_WINDOW must be in [0, blockSize]: the window is bound through the block-size scratch.");
+    if (mContextWindow > 0)
+    {
+        for (auto& window : mDraftWindow)
+        {
+            window = Tensor({maxBatch, mContextWindow, mBlockDraft.baseOutputHiddenDim}, DeviceType::kGPU,
+                nvinfer1::DataType::kHALF, "DFlashDraft::contextWindow");
+        }
+        LOG_INFO("DFlash draft context window: last %d target rows", mContextWindow);
+    }
 
     int32_t const packedMaskLen = divUp(mBlockDraft.blockSize, 32);
     mDraftPackedAttentionMask = Tensor({maxBatch, mBlockDraft.blockSize, packedMaskLen}, DeviceType::kGPU,
@@ -354,11 +376,19 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
         }
     }
 
+    if (mContextWindow > 0)
+    {
+        maxDeltaLen = slideDraftContextWindow(activeBatchSize, sourceSeqLen, context.generationRound == 0, context.stream);
+    }
+
     check::check(mDraftDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    bindTargetHiddenDelta(activeBatchSize, maxDeltaLen, sourceSeqLen, context.generationRound == 0, context.stream);
+    if (mContextWindow == 0)
+    {
+        bindTargetHiddenDelta(activeBatchSize, maxDeltaLen, sourceSeqLen, context.generationRound == 0, context.stream);
+    }
 
     // Step 4: Prepare proposal attention inputs.
     int32_t const pmLen = divUp(BS, 32);
@@ -693,6 +723,61 @@ void DFlashDecoder::copyVerifyTokenIdsToBaseInput(int32_t batchSize, int32_t ver
     check::check(mRuntime.preprocess.idsInput.reshape({batchSize, verifySize}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), mVerifyTokenIds.rawPointer(),
         static_cast<size_t>(batchSize) * verifySize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+}
+
+int64_t DFlashDecoder::slideDraftContextWindow(
+    int32_t activeBatchSize, int64_t sourceSeqLen, bool firstRound, cudaStream_t stream)
+{
+    // Appends this round's delta rows (right-padded per slot in baseHiddenStates) to each slot's window, keeps
+    // the last mContextWindow rows, and binds them as the whole draft context: the draft cache restarts at 0, so
+    // the window takes positions [0, fill) and the proposal [fill, fill + blockSize), as in training.
+    int32_t const window = mContextWindow;
+    size_t const rowBytes = static_cast<size_t>(mBlockDraft.baseOutputHiddenDim) * sizeof(half);
+    if (firstRound)
+    {
+        mDraftWindowFill.assign(static_cast<size_t>(activeBatchSize), 0);
+    }
+    Tensor& previous = mDraftWindow[mDraftWindowCurrent];
+    Tensor& next = mDraftWindow[1 - mDraftWindowCurrent];
+    auto const* base = static_cast<char const*>(mRuntime.base.pipelineIO.baseHiddenStates.rawPointer());
+    auto const* previousRows = static_cast<char const*>(previous.rawPointer());
+    auto* nextRows = static_cast<char*>(next.rawPointer());
+    int32_t* hostDeltaLens = mHostDeltaLens.dataPointer<int32_t>();
+    int32_t maxFill = 0;
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        int32_t const delta = hostDeltaLens[b];
+        int32_t const fill = mDraftWindowFill[static_cast<size_t>(b)];
+        int32_t const take = std::min(delta, window);
+        int32_t const keep = std::min(fill, window - take);
+        char* slot = nextRows + static_cast<size_t>(b) * window * rowBytes;
+        if (keep > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(slot, previousRows + (static_cast<size_t>(b) * window + fill - keep) * rowBytes,
+                keep * rowBytes, cudaMemcpyDeviceToDevice, stream));
+        }
+        if (take > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(slot + keep * rowBytes,
+                base + (static_cast<size_t>(b) * sourceSeqLen + delta - take) * rowBytes, take * rowBytes,
+                cudaMemcpyDeviceToDevice, stream));
+        }
+        mDraftWindowFill[static_cast<size_t>(b)] = keep + take;
+        hostDeltaLens[b] = keep + take;
+        maxFill = std::max(maxFill, keep + take);
+    }
+    mDraftWindowCurrent = 1 - mDraftWindowCurrent;
+    check::check(next.reshape({activeBatchSize, window, mBlockDraft.baseOutputHiddenDim}), "Tensor reshape failed");
+
+    check::check(mDraftTargetHidden.reshape({activeBatchSize, maxFill, mBlockDraft.baseOutputHiddenDim}),
+        "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpy2DAsync(mDraftTargetHidden.rawPointer(), maxFill * rowBytes, next.rawPointer(),
+        window * rowBytes, maxFill * rowBytes, activeBatchSize, cudaMemcpyDeviceToDevice, stream));
+    mDraftTensorMap.set(binding_names::kDFlashTargetHiddenConcat, mDraftTargetHidden);
+
+    CUDA_CHECK(cudaMemsetAsync(
+        mDraftCacheManager.getKVCacheLengths().rawPointer(), 0, activeBatchSize * sizeof(int32_t), stream));
+    return maxFill;
 }
 
 void DFlashDecoder::bindTargetHiddenDelta(
@@ -1186,6 +1271,20 @@ void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32
         check::check(tensor.reshape(newShape), "Tensor reshape failed");
     };
     compactDeviceTensor(mRuntime.base.pipelineIO.baseHiddenStates);
+    if (mContextWindow > 0 && !mDraftWindowFill.empty())
+    {
+        compactDeviceTensor(mDraftWindow[mDraftWindowCurrent]);
+        std::vector<int32_t> fill(static_cast<size_t>(newActiveBatch), 0);
+        for (int32_t oldSlot = 0; oldSlot < oldActiveBatch; ++oldSlot)
+        {
+            int32_t const newSlot = batchMapping[static_cast<size_t>(oldSlot)];
+            if (newSlot >= 0)
+            {
+                fill[static_cast<size_t>(newSlot)] = mDraftWindowFill[static_cast<size_t>(oldSlot)];
+            }
+        }
+        mDraftWindowFill = std::move(fill);
+    }
     if (mCommonStateTracker.draftPrefillOutputsPending())
     {
         compactDeviceTensor(mDraftOutputLogits);

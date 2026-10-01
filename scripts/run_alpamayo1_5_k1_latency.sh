@@ -5,6 +5,7 @@
 # The converter writes each clip 6 times (batch 6, one noise per sample); this keeps one
 # copy per clip, cools the board to 50 C before each file and warms up WARMUP runs (default 25,
 # about 60 s: the Thor GPU steps up only after ~40 s of load, so a few runs measure the slow state).
+# TEMPERATURE overrides the inputs' sampling temperature (0 = greedy, which DFlash decoding forces).
 # Results: $L/k1_outputs/{output,profile}_NNNN.json and .log.
 set -euo pipefail
 : "${L:?set L to the work dir}"
@@ -17,7 +18,7 @@ INFER_REPO="${INFER_REPO:-$HOME/Documents/Alpamayo/11_Inference/YSH-Inference-Al
 PY="${PYTHON:-$INFER_REPO/a1_5_venv/bin/python}"
 mkdir -p "$L/k1_inputs" "$L/k1_outputs"
 # The converter writes each clip 6 times (batch 6, one noise per sample); keep one copy.
-"$PY" - "$L" <<'PY'
+"$PY" - "$L" "${TEMPERATURE:-}" <<'PY'
 import json, sys
 from pathlib import Path
 L = Path(sys.argv[1])
@@ -25,6 +26,8 @@ for f in sorted((L / "inputs").glob("input_*.json")):
     d = json.loads(f.read_text())
     d["batch_size"] = 1
     d["requests"] = d["requests"][::6]
+    if sys.argv[2]:
+        d["temperature"] = float(sys.argv[2])
     (L / "k1_inputs" / f.name).write_text(json.dumps(d))
     print(f.name, len(d["requests"]), "requests")
 PY

@@ -1386,9 +1386,31 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
             if (hasActionRequest
                 && request.requests[static_cast<size_t>(context.batchIndexMapping[i])].pastTrajectory.has_value())
             {
-                if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
-                    && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
+                // The KV cache holds every token but the newest, and the action head reads it up to
+                // <|traj_future_start|>. A speculative round can accept several tokens at once, so the
+                // marker may sit deeper than size - 2; drop what follows it from the KV and the tokens.
+                auto& ids = context.tokenIds[i];
+                auto const kvEnd = ids.size() > 1 ? ids.end() - 1 : ids.begin();
+                auto const marker = std::find(ids.begin(), kvEnd, trajFutureStartId);
+                if (trajFutureStartId >= 0 && marker != kvEnd)
                 {
+                    int32_t const excess = static_cast<int32_t>(kvEnd - marker) - 1;
+                    if (excess > 0)
+                    {
+                        int32_t* slotLength
+                            = static_cast<int32_t*>(mSharedResources->cacheManagers[0]->getKVCacheLengths().rawPointer())
+                            + i;
+                        int32_t length{};
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            &length, slotLength, sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+                        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+                        length -= excess;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            slotLength, &length, sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+                        CUDA_CHECK(cudaStreamSynchronize(context.stream));
+                        context.currentGenerateLengths[i] -= excess;
+                        ids.erase(marker + 2, ids.end());
+                    }
                     context.finishedStates[i] = 1;
                     s.terminalReason = FinishReason::kEndId;
                     LOG_DEBUG("Batch %d finished, reason: traj_future_start", i);

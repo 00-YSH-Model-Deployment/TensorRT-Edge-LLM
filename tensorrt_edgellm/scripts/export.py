@@ -1596,6 +1596,14 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
         if draft_vec is not None:
             break
     if draft_vec is None:
+        # z-lab drafts ship the trained mask row alone; their mask id is one
+        # past the base vocabulary, so the row is appended below.
+        mask_file = os.path.join(dflash_draft_dir, "mask_embedding.pt")
+        if os.path.exists(mask_file):
+            draft_vec = torch.load(mask_file,
+                                   map_location="cpu",
+                                   weights_only=True).to(torch.float32)
+    if draft_vec is None:
         logger.info("[DFlash] draft checkpoint has no embed_tokens; mask "
                     "embedding is shared with the base (no fold needed)")
         return
@@ -1609,10 +1617,15 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
         weight = f.get_tensor("embedding")
 
     patched_row = (draft_vec * embedding_scale).to(weight.dtype)
-    if torch.allclose(weight[mask_id].to(torch.float32),
-                      patched_row.to(torch.float32),
-                      atol=1e-3,
-                      rtol=0.0):
+    if mask_id == weight.shape[0]:
+        weight = torch.cat([weight, weight.new_zeros(1, weight.shape[1])])
+    elif mask_id > weight.shape[0]:
+        raise ValueError(f"DFlash mask_token_id {mask_id} is beyond the base "
+                         f"embedding table ({weight.shape[0]} rows)")
+    elif torch.allclose(weight[mask_id].to(torch.float32),
+                        patched_row.to(torch.float32),
+                        atol=1e-3,
+                        rtol=0.0):
         logger.info(
             "[DFlash] draft mask embedding (id=%d) matches base; no fold needed",
             mask_id)

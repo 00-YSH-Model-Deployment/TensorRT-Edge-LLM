@@ -119,10 +119,11 @@ CachedBlockDraftRuntimeConfig makeCachedBlockDraftRuntimeConfig(DeploymentConfig
         ELLM_CHECK(deployment.base.specDraftCausalHead && deployment.draft->specDraftCausalHead,
             "JetSpec requires causal proposal attention in both base and draft configs.");
     }
-    ELLM_CHECK(cfg.maskTokenId >= 0 && cfg.maskTokenId < cfg.draftVocabSize,
+    // The mask token is only embedded, never emitted, so its bound is the input embedding table (checked by
+    // DFlashDecoder); some drafts place it one past the output vocabulary.
+    ELLM_CHECK(cfg.maskTokenId >= 0,
         std::string(specDecodeModeName(userMode)) + " cached block draft mask_token_id ("
-            + std::to_string(cfg.maskTokenId) + ") is outside draft vocab range [0, "
-            + std::to_string(cfg.draftVocabSize) + ").");
+            + std::to_string(cfg.maskTokenId) + ") must be non-negative.");
 
     return cfg;
 }

@@ -96,6 +96,7 @@ private:
     void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
     void bindTargetHiddenDelta(
         int32_t activeBatchSize, int64_t maxDeltaLen, int64_t sourceSeqLen, bool allowLargeDelta, cudaStream_t stream);
+    int64_t slideDraftContextWindow(int32_t activeBatchSize, int64_t sourceSeqLen, bool firstRound, cudaStream_t stream);
     bool checkCudaLastError(char const* stage) const;
     bool useDDTree() const noexcept
     {
@@ -122,6 +123,14 @@ private:
     Tensor mDraftTargetHidden;        //!< Compact scratch for [B, <= blockSize, baseOutputHiddenDim] FP16
     Tensor mDraftPrefillTargetHidden; //!< Lazy scratch for non-compact round-0 target hidden FP16, max batch reserve
     Tensor mDraftOutputLogits;        //!< [B, blockSize, vocabSize] FP32
+
+    //! EDGELLM_DFLASH_CONTEXT_WINDOW=N (0 = off, N <= blockSize): the draft attends only to the last N target
+    //! rows, rewritten each round at draft positions [0, N), for drafts trained on a short context window
+    //! (z-lab Alpamayo DFlash uses 8).
+    int32_t mContextWindow{0};
+    Tensor mDraftWindow[2];                //!< [B, mContextWindow, baseOutputHiddenDim] FP16, ping-pong
+    int32_t mDraftWindowCurrent{0};        //!< Index of the buffer holding the latest window
+    std::vector<int32_t> mDraftWindowFill; //!< Valid rows per batch slot
 
     Tensor mDraftPackedAttentionMask; //!< [B, blockSize, divUp(blockSize,32)] INT32
     Tensor mDraftAttentionPosId;      //!< [B, blockSize] INT32

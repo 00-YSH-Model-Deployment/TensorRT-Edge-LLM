@@ -883,6 +883,7 @@ def _load_dflash_lm_head(model: nn.Module,
         "model.lm_head.weight",
         "language_model.lm_head.weight",
         "model.language_model.lm_head.weight",
+        "vlm.lm_head.weight",
     ]
     embed_candidates = [
         "model.embed_tokens.weight",
