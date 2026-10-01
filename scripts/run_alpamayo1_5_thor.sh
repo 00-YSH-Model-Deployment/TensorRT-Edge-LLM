@@ -29,7 +29,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 : "${ONNX_DIR:?set ONNX_DIR}" "${WORK_DIR:?set WORK_DIR}"
-INFER_REPO="${INFER_REPO:-$HOME/Documents/Alpamayo/YSH-Inference-Alpamayo-1.5}"
+INFER_REPO="${INFER_REPO:-$HOME/Documents/Alpamayo/11_Inference/YSH-Inference-Alpamayo-1.5}"
 CLIP_LIST="${CLIP_LIST:-$INFER_REPO/notebooks/clip_ids_gold644.parquet}"
 NUM_SAMPLES=6            # 엔진 maxBatchSize 와 입력 batch_size 가 같아야 한다
 KV_CAPACITY=4096         # export 의 --max-kv-cache-capacity 와 같아야 한다

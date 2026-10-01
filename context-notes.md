@@ -89,3 +89,15 @@ FP16 가중치 합계 = 15.17 + 1.28 + 1.16 + 4.56 ≈ **22.2 GB**. KV cache 409
 - 샘플링은 upstream 기본값에 맞춘다. temperature 0.6, top_p 0.98, top_k 0 (비활성, upstream 은 None), max_generate_length 256.
 - PyTorch 와는 noise 를 맞출 수 없어 (Edge-LLM 은 seed 만 받음) clip 별 1:1 이 아니라 분포 비교다.
 - 미확인 위험. action expert 가 쓰는 TRT 네이티브 Attention 레이어가 Thor TRT 버전에서 빌드되는지, batch 6 추론의 실제 메모리.
+
+## 2026-10-01 — Thor 에서 export, 빌드 도구 부족
+
+- **ONNX 는 A100 에서 복사하지 않고 Thor 에서 다시 export 했다.** 레포 안 `.venv` 를 Thor 에도 만들었다. Python 3.12, torch `2.13.0+cpu` (pytorch CPU index, aarch64), `.[export,tools]` 로 transformers 5.14.1, modelopt 0.45.0 이 들어갔다. `uv` 명령에는 `--no-config` 를 붙였다.
+  - 명령: `CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=12 tensorrt-edgellm-export <1.5 snapshot 7aba829> ~/Documents/Alpamayo/00_Model/Alpamayo-1.5_EdgeLLM/onnx --max-kv-cache-capacity 4096`
+  - 약 6분 걸렸다(20:31 → 20:37). exit 0 이다.
+  - 크기는 llm 16 GB, visual 1.1 GB, action 4.3 GB 로 A100 결과와 같다.
+  - `processed_chat_template.json` 은 Qwen 형식이고 `generation_prompt = "<|im_start|>assistant\n<|cot_start|>"` 다.
+- **C++ 빌드는 아직 못 한다.** 이 Thor 에는 gcc 만 있고 g++, cmake, nvcc, TensorRT 개발 헤더가 없다. 설치에 sudo 가 필요하다.
+  - `sudo apt install cmake build-essential cuda-toolkit-13-0 libnvinfer-dev libnvinfer-headers-dev libnvonnxparsers-dev python3.12-dev`
+  - apt 의 TensorRT 는 10.13.3.9 (JetPack 7.1) 다. 그래서 action 엔진(TRT ≥ 10.15 연산)은 실패할 가능성이 그대로 남아 있다.
+- 폴더를 번호 구조로 정리하면서 추론 저장소가 `~/Documents/Alpamayo/11_Inference/YSH-Inference-Alpamayo-1.5` 로 옮겨졌다. `run_alpamayo1_5_thor.sh` 의 `INFER_REPO` 기본값도 이 경로로 바꿨다.

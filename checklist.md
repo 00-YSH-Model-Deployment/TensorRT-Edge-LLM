@@ -20,7 +20,7 @@
 
 ## Phase 1 — Thor (2026-09-30 사용자 결정, A100 은 여유 없어 보류)
 
-- [ ] ONNX (`/home/Humble/extra2/trt/alpamayo1_5_edgellm/onnx`, 약 22 GB) 를 Thor 로 복사
+- [x] ONNX — 복사 대신 Thor 에서 다시 export (2026-10-01, CPU 약 6분, `~/Documents/Alpamayo/00_Model/Alpamayo-1.5_EdgeLLM/onnx`, llm 16 GB / visual 1.1 GB / action 4.3 GB)
 - [ ] `check` — JetPack 의 TensorRT 가 10.15 이상인지 (미만이면 action_build 실패 가능)
 - [ ] `build` — C++ 빌드 (sm_110 CuTe DSL prebuilt 동봉, 커널 빌드 불필요)
 - [ ] `engines` — llm / visual / action, maxBatchSize 6
