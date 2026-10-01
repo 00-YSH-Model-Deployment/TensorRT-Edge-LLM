@@ -597,6 +597,12 @@ int main(int argc, char* argv[])
 
     try
     {
+        // EDGELLM_ENCODER_CACHE_MB sets the encoder embedding cache budget (0 disables it).
+        rt::ContextCacheConfig cacheConfig{};
+        if (char const* cacheMb = std::getenv("EDGELLM_ENCODER_CACHE_MB"))
+        {
+            cacheConfig.encoderEmbeddingCacheBudgetBytes = static_cast<int64_t>(std::atoll(cacheMb)) << 20;
+        }
         // EDGELLM_DFLASH_BLOCK=<n> runs the VLM with DFlash speculative decoding: the base engine in
         // engineDir must be built with --specBase and the DFlash draft engine beside it (--specDraft).
         // One draft pass proposes n tokens and the base verifies them in one forward (chain, top-1).
@@ -610,13 +616,13 @@ int main(int argc, char* argv[])
             draftingConfig.verifySize = draftingConfig.dflashBlockSize;
             LOG_INFO("DFlash speculative decoding enabled, block size %d", draftingConfig.dflashBlockSize);
             llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir,
-                args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream, rt::ContextCacheConfig{},
+                args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream, cacheConfig,
                 args.checkpointDir);
         }
         else
         {
             llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir,
-                args.multimodalEngineDir, loraWeightsMap, stream, rt::ContextCacheConfig{}, args.checkpointDir);
+                args.multimodalEngineDir, loraWeightsMap, stream, cacheConfig, args.checkpointDir);
         }
     }
     catch (std::exception const& e)

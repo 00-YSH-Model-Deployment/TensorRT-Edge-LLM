@@ -42,6 +42,7 @@
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
 #include "sampler/sampling.h"
 #include <algorithm>
+#include <numeric>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -1785,6 +1786,170 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
     return true;
 }
 
+bool LLMRankRuntime::encodeVisionWithCache(LLMGenerationRequest const& request,
+    std::vector<imageUtils::ImageData const*> const& images, std::vector<Hash128> const& imageHashes,
+    std::vector<std::vector<int32_t>>& batchedInputIds, rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream)
+{
+    // Level 0 is the ViT output embedding and levels 1.. the deepstack taps the LLM adds after its first layers.
+    // Each image is cached per level and counts as a hit only when every level is present; only missed images
+    // go through the ViT. Per-image outputs are independent (the ViT attends within an image), so a subset
+    // encode yields the same rows as a full one.
+    std::vector<std::reference_wrapper<rt::Tensor>> buffers{std::ref(mVisionRunner->getOutputEmbedding())};
+    for (auto& level : mVisionRunner->getDeepstackFeatureBuffers())
+    {
+        buffers.push_back(level);
+    }
+    size_t const levels = buffers.size();
+    auto const levelKey = [](Hash128 key, size_t level) {
+        key.lo ^= 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(level);
+        return key;
+    };
+    auto const rowBytes = [&](size_t level) {
+        rt::Tensor const& t = buffers[level].get();
+        return static_cast<size_t>(t.getShape()[1]) * rt::utils::getTypeSize(t.getDataType());
+    };
+    auto const storeImage = [&](size_t image, size_t level, void const* src, int64_t tokens) {
+        rt::Tensor const& t = buffers[level].get();
+        mEncoderEmbeddingCache->storeSlice(
+            levelKey(imageHashes[image], level), src, tokens, t.getShape()[1], t.getDataType(), stream);
+    };
+
+    std::vector<std::vector<rt::Tensor const*>> cached(images.size());
+    std::vector<size_t> missing;
+    for (size_t i = 0; i < images.size(); ++i)
+    {
+        for (size_t level = 0; level < levels; ++level)
+        {
+            auto const hit = mEncoderEmbeddingCache->lookup(levelKey(imageHashes[i], level));
+            if (!hit)
+            {
+                break;
+            }
+            cached[i].push_back(&hit->get());
+        }
+        if (cached[i].size() != levels)
+        {
+            cached[i].clear();
+            missing.push_back(i);
+        }
+    }
+
+    if (missing.size() == images.size())
+    {
+        if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream)
+            || !mVisionRunner->infer(stream))
+        {
+            LOG_ERROR("Vision encoding failed. This request cannot be handled.");
+            return false;
+        }
+        auto const& tokenLengths = mVisionRunner->getLastMediaTokenLengths();
+        if (tokenLengths.size() != images.size())
+        {
+            return true;
+        }
+        std::vector<size_t> offsets(levels, 0);
+        for (size_t i = 0; i < images.size(); ++i)
+        {
+            for (size_t level = 0; level < levels; ++level)
+            {
+                storeImage(i, level, static_cast<char const*>(buffers[level].get().rawPointer()) + offsets[level],
+                    tokenLengths[i]);
+                offsets[level] += static_cast<size_t>(tokenLengths[i]) * rowBytes(level);
+            }
+        }
+        return true;
+    }
+
+    // Encode the missed images alone and park their rows in scratch: the full-request layout below reuses the
+    // runner buffers, and storing into the cache now could evict entries this request still reads.
+    std::vector<int64_t> missedTokens;
+    if (!missing.empty())
+    {
+        LLMGenerationRequest subRequest;
+        subRequest.requests.resize(1);
+        for (size_t const i : missing)
+        {
+            subRequest.requests[0].imageBuffers.push_back(*images[i]);
+        }
+        std::vector<std::vector<int32_t>> unusedIds;
+        if (!mVisionRunner->preprocess(subRequest, unusedIds, mTokenizer, std::nullopt, stream, true)
+            || !mVisionRunner->infer(stream))
+        {
+            LOG_ERROR("Vision encoding of uncached images failed. This request cannot be handled.");
+            return false;
+        }
+        missedTokens = mVisionRunner->getLastMediaTokenLengths();
+        int64_t const total = std::accumulate(missedTokens.begin(), missedTokens.end(), int64_t{0});
+        mVisionCacheScratch.resize(levels);
+        for (size_t level = 0; level < levels; ++level)
+        {
+            rt::Tensor const& src = buffers[level].get();
+            size_t const bytes = static_cast<size_t>(total) * rowBytes(level);
+            if (mVisionCacheScratch[level].getMemoryCapacity() < static_cast<int64_t>(bytes))
+            {
+                mVisionCacheScratch[level] = rt::Tensor({total, src.getShape()[1]}, rt::DeviceType::kGPU,
+                    src.getDataType(), "LLMRankRuntime::mVisionCacheScratch");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(mVisionCacheScratch[level].rawPointer(), src.rawPointer(), bytes,
+                cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream, false, true))
+    {
+        LOG_ERROR("Vision text preprocessing failed on encoder cache hit.");
+        return false;
+    }
+    auto const& tokenLengths = mVisionRunner->getLastMediaTokenLengths();
+    ELLM_CHECK(tokenLengths.size() == images.size(), "Vision token lengths do not match the request images");
+    int64_t const totalTokens = std::accumulate(tokenLengths.begin(), tokenLengths.end(), int64_t{0});
+    for (size_t level = 1; level < levels; ++level)
+    {
+        rt::Tensor& t = buffers[level].get();
+        check::check(t.reshape({totalTokens, t.getShape()[1]}), "Tensor reshape failed");
+    }
+
+    std::vector<size_t> dstOffsets(levels, 0);
+    std::vector<size_t> srcOffsets(levels, 0);
+    size_t missIndex = 0;
+    for (size_t i = 0; i < images.size(); ++i)
+    {
+        bool const hit = !cached[i].empty();
+        if (!hit)
+        {
+            ELLM_CHECK(missedTokens[missIndex] == tokenLengths[i], "Subset encode token count mismatch");
+            ++missIndex;
+        }
+        for (size_t level = 0; level < levels; ++level)
+        {
+            size_t const bytes = static_cast<size_t>(tokenLengths[i]) * rowBytes(level);
+            char const* src = hit ? static_cast<char const*>(cached[i][level]->rawPointer())
+                                  : static_cast<char const*>(mVisionCacheScratch[level].rawPointer()) + srcOffsets[level];
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(buffers[level].get().rawPointer()) + dstOffsets[level], src,
+                bytes, cudaMemcpyDeviceToDevice, stream));
+            dstOffsets[level] += bytes;
+            if (!hit)
+            {
+                srcOffsets[level] += bytes;
+            }
+        }
+    }
+
+    std::vector<size_t> scratchOffsets(levels, 0);
+    for (size_t const i : missing)
+    {
+        for (size_t level = 0; level < levels; ++level)
+        {
+            storeImage(i, level, static_cast<char const*>(mVisionCacheScratch[level].rawPointer()) + scratchOffsets[level],
+                tokenLengths[i]);
+            scratchOffsets[level] += static_cast<size_t>(tokenLengths[i]) * rowBytes(level);
+        }
+    }
+    LOG_INFO("Encoder embedding cache: %zu of %zu images hit, ViT ran on %zu", images.size() - missing.size(),
+        images.size(), missing.size());
+    return true;
+}
+
 bool LLMRankRuntime::multiModalRuntimePreprocess(
     LLMGenerationRequest const& request, DecodingInferenceContext& context, cudaStream_t stream)
 {
@@ -1940,9 +2105,8 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
     // Process vision inputs (if present)
     if (hasVision && mVisionRunner)
     {
-        bool visionCacheHit = false;
+        std::vector<imageUtils::ImageData const*> images;
         std::vector<Hash128> imageHashes;
-
         if (mEncoderEmbeddingCache)
         {
             bool hashable = true;
@@ -1955,6 +2119,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
                         auto const* rawPtr = reinterpret_cast<char const*>(img.data());
                         size_t const rawBytes = static_cast<size_t>(img.bytesPerFrame()) * img.frames;
                         imageHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
+                        images.push_back(&img);
                     }
                     else
                     {
@@ -1968,79 +2133,27 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
             }
         }
 
-        bool allHit = mEncoderEmbeddingCache && !imageHashes.empty();
-        std::vector<std::reference_wrapper<rt::Tensor const>> cachedVision;
-        if (allHit)
+        if (!imageHashes.empty())
         {
-            for (auto const& h : imageHashes)
+            if (!encodeVisionWithCache(request, images, imageHashes, batchedInputIds, mropeCosSinOut, stream))
             {
-                auto r = mEncoderEmbeddingCache->lookup(h);
-                if (!r)
-                {
-                    allHit = false;
-                    break;
-                }
-                cachedVision.push_back(std::cref(r->get()));
-            }
-        }
-
-        if (allHit)
-        {
-            LOG_INFO(
-                "Encoder embedding cache HIT for all %zu images — skipping ViT encoder execution", imageHashes.size());
-            if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream, false, true))
-            {
-                LOG_ERROR("Vision text preprocessing failed on cache hit.");
                 return false;
             }
-            rt::Tensor& output = mVisionRunner->getOutputEmbedding();
-            int64_t byteOffset = 0;
-            for (auto const& entry : cachedVision)
-            {
-                int64_t const bytes = entry.get().getMemoryCapacity();
-                CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(output.rawPointer()) + byteOffset,
-                    entry.get().rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
-                byteOffset += bytes;
-            }
-            visionCacheHit = true;
         }
-
-        if (!visionCacheHit)
+        else
         {
             if (!mVisionRunner->preprocess(request, batchedInputIds, mTokenizer, mropeCosSinOut, stream))
             {
                 LOG_ERROR("Vision preprocessing failed. This request cannot be handled.");
                 return false;
             }
-
             if (!mVisionRunner->infer(stream))
             {
                 LOG_ERROR("Vision inference failed. This request cannot be handled.");
                 return false;
             }
-
-            if (mEncoderEmbeddingCache && !imageHashes.empty())
-            {
-                rt::Tensor const& output = mVisionRunner->getOutputEmbedding();
-                auto const& tokenLengths = mVisionRunner->getLastMediaTokenLengths();
-                if (tokenLengths.size() == imageHashes.size())
-                {
-                    int64_t const hiddenSize = output.getShape()[1];
-                    size_t const typeSize = rt::utils::getTypeSize(output.getDataType());
-                    int64_t byteOffset = 0;
-                    for (size_t i = 0; i < imageHashes.size(); ++i)
-                    {
-                        int64_t const numTok = tokenLengths[i];
-                        mEncoderEmbeddingCache->storeSlice(imageHashes[i],
-                            static_cast<char const*>(output.rawPointer()) + byteOffset, numTok, hiddenSize,
-                            output.getDataType(), stream);
-                        byteOffset += numTok * hiddenSize * static_cast<int64_t>(typeSize);
-                    }
-                }
-            }
         }
     }
-
     // Process action inputs (if present)
     if (hasTrajectoryHistory && mActionRunner)
     {

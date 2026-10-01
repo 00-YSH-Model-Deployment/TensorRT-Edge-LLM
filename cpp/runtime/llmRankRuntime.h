@@ -306,6 +306,7 @@ private:
     std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
     tokenizer::Tokenizer* mTokenizer{nullptr};                     //!< Shared tokenizer owned by RuntimeCoordinator
     std::unique_ptr<EncoderEmbeddingCache> mEncoderEmbeddingCache; //!< Content-addressed encoder output cache
+    std::vector<rt::Tensor> mVisionCacheScratch; //!< Per-level rows of images encoded on a partial cache hit
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase;          //!< System prompt KVCache for base model
     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
@@ -393,6 +394,14 @@ private:
     //! and clears stale multimodal request state.
     bool multiModalRuntimePreprocess(
         LLMGenerationRequest const& request, DecodingInferenceContext& context, cudaStream_t stream);
+
+    //! Encode the request's images through the encoder embedding cache: cached images (main embedding and every
+    //! deepstack level) are restored, the rest go through the ViT alone, and the full-request layout is assembled
+    //! in the runner's buffers.
+    bool encodeVisionWithCache(LLMGenerationRequest const& request,
+        std::vector<imageUtils::ImageData const*> const& images, std::vector<Hash128> const& imageHashes,
+        std::vector<std::vector<int32_t>>& batchedInputIds, rt::OptionalOutputTensor mropeCosSinOut,
+        cudaStream_t stream);
 
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
     //! @throws std::runtime_error if a CUDA operation fails

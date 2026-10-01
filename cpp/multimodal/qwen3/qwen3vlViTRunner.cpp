@@ -161,6 +161,11 @@ rt::OptionalInputTensors Qwen3VLViTRunner::getDeepstackFeatures()
     return refs;
 }
 
+std::vector<std::reference_wrapper<rt::Tensor>> Qwen3VLViTRunner::getDeepstackFeatureBuffers()
+{
+    return {mDeepstackFeatures.begin(), mDeepstackFeatures.end()};
+}
+
 void Qwen3VLViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
     std::vector<int64_t> const& spansPerRequest, trt_edgellm::tokenizer::Tokenizer const* tokenizer)

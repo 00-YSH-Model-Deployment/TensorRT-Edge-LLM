@@ -34,6 +34,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <variant>
+#include <functional>
 #include <vector>
 
 namespace trt_edgellm
@@ -156,6 +157,10 @@ public:
     //! @brief Get deepstack features for Qwen3-VL models
     //! @return Optional deepstack features vector (raw features before embedding lookup)
     virtual rt::OptionalInputTensors getDeepstackFeatures();
+
+    //! @brief Writable deepstack feature buffers, for restoring cached encoder outputs into them
+    //! @return One tensor per deepstack level; empty when the model has none
+    virtual std::vector<std::reference_wrapper<rt::Tensor>> getDeepstackFeatureBuffers();
 
     /*!
      * @brief Validate and fill configuration from file
