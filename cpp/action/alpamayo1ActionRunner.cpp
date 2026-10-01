@@ -28,6 +28,8 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include <algorithm>
+#include <string>
+#include <cstdlib>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -314,10 +316,10 @@ std::vector<std::vector<FutureTrajectoryPoint>> Alpamayo1ActionRunner::sampleTra
     // Initialize time steps for denoising iterations
     float* t0Host = static_cast<float*>(mTimeStepsT0Host.rawPointer());
     float* t1Host = static_cast<float*>(mTimeStepsT1Host.rawPointer());
-    for (int32_t i = 0; i < kNumDenoiseSteps; ++i)
+    for (int32_t i = 0; i < mNumDenoiseSteps; ++i)
     {
-        t0Host[i] = static_cast<float>(i) / kNumDenoiseSteps;
-        t1Host[i] = static_cast<float>(i + 1) / kNumDenoiseSteps;
+        t0Host[i] = static_cast<float>(i) / mNumDenoiseSteps;
+        t1Host[i] = static_cast<float>(i + 1) / mNumDenoiseSteps;
     }
 
     // Initialize indices for indexing into the rope table
@@ -361,26 +363,65 @@ std::vector<std::vector<FutureTrajectoryPoint>> Alpamayo1ActionRunner::sampleTra
         static_cast<size_t>(activeBatchSize) * static_cast<size_t>(mNumWaypoints) * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
 
-    // Run denoising iterations
-    for (int32_t i = 0; i < kNumDenoiseSteps; ++i)
+    // Run denoising iterations. The engine performs one Euler step, x1 = x0 + (t1 - t0) * v. On a
+    // cached step the engine is skipped and the velocity of the last computed step is reused (FlashDrive's
+    // action caching); that velocity is recovered as (x1 - x0) / (t1 - t0). The trajectory is a few hundred
+    // floats, so the cached path round-trips through the host.
+    size_t const trajElems = static_cast<size_t>(activeBatchSize) * static_cast<size_t>(mNumWaypoints) * 2ULL;
+    size_t const trajBytes = trajElems * sizeof(float);
+    bool const anyCached = std::find(mCacheStep.begin(), mCacheStep.end(), true) != mCacheStep.end();
+    std::vector<float> xIn(anyCached ? trajElems : 0), xOut(anyCached ? trajElems : 0),
+        velocity(anyCached ? trajElems : 0);
+    float const* t0All = static_cast<float*>(mTimeStepsT0Host.rawPointer());
+    float const* t1All = static_cast<float*>(mTimeStepsT1Host.rawPointer());
+    for (int32_t i = 0; i < mNumDenoiseSteps; ++i)
     {
-        float* t0Ptr = static_cast<float*>(mTimeStepsT0Host.rawPointer()) + i;
-        float* t1Ptr = static_cast<float*>(mTimeStepsT1Host.rawPointer()) + i;
-
-        CUDA_CHECK(
-            cudaMemcpyAsync(mTimeStepsT0Device.rawPointer(), t0Ptr, sizeof(float), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(
-            cudaMemcpyAsync(mTimeStepsT1Device.rawPointer(), t1Ptr, sizeof(float), cudaMemcpyHostToDevice, stream));
-
-        if (!mContext->enqueueV3(stream))
+        float const dt = t1All[i] - t0All[i];
+        if (mCacheStep[static_cast<size_t>(i)])
         {
-            LOG_ERROR("enqueueV3 failed at denoise step %d", i);
-            return result;
+            CUDA_CHECK(cudaMemcpyAsync(xIn.data(), mNoiseTrajectoryDevice.rawPointer(), trajBytes,
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (size_t k = 0; k < trajElems; ++k)
+            {
+                xOut[k] = xIn[k] + dt * velocity[k];
+            }
+            CUDA_CHECK(cudaMemcpyAsync(mDenoisedTrajectoryDevice.rawPointer(), xOut.data(), trajBytes,
+                cudaMemcpyHostToDevice, stream));
+        }
+        else
+        {
+            bool const nextCached = anyCached
+                && std::find(mCacheStep.begin() + i + 1, mCacheStep.end(), true) != mCacheStep.end();
+            if (nextCached)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(xIn.data(), mNoiseTrajectoryDevice.rawPointer(), trajBytes,
+                    cudaMemcpyDeviceToHost, stream));
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                mTimeStepsT0Device.rawPointer(), t0All + i, sizeof(float), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                mTimeStepsT1Device.rawPointer(), t1All + i, sizeof(float), cudaMemcpyHostToDevice, stream));
+
+            if (!mContext->enqueueV3(stream))
+            {
+                LOG_ERROR("enqueueV3 failed at denoise step %d", i);
+                return result;
+            }
+            if (nextCached)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(xOut.data(), mDenoisedTrajectoryDevice.rawPointer(), trajBytes,
+                    cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                for (size_t k = 0; k < trajElems; ++k)
+                {
+                    velocity[k] = (xOut[k] - xIn[k]) / dt;
+                }
+            }
         }
 
         CUDA_CHECK(cudaMemcpyAsync(mNoiseTrajectoryDevice.rawPointer(), mDenoisedTrajectoryDevice.rawPointer(),
-            static_cast<size_t>(activeBatchSize) * static_cast<size_t>(mNumWaypoints) * 2ULL * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream));
+            trajBytes, cudaMemcpyDeviceToDevice, stream));
     }
 
     // Copy result back to host
@@ -470,8 +511,41 @@ bool Alpamayo1ActionRunner::parseModelConfig(std::string const& configPath)
     return true;
 }
 
+void Alpamayo1ActionRunner::parseDenoiseSchedule()
+{
+    if (char const* steps = std::getenv("EDGELLM_ALPAMAYO_DENOISE_STEPS"))
+    {
+        mNumDenoiseSteps = std::max(1, std::atoi(steps));
+    }
+    mCacheStep.assign(static_cast<size_t>(mNumDenoiseSteps), false);
+    if (char const* cache = std::getenv("EDGELLM_ALPAMAYO_CACHE_STEPS"))
+    {
+        std::string list(cache);
+        size_t pos = 0;
+        while (pos < list.size())
+        {
+            size_t const end = std::min(list.find(',', pos), list.size());
+            std::string const item = list.substr(pos, end - pos);
+            if (!item.empty())
+            {
+                int32_t const step = std::atoi(item.c_str());
+                if (step <= 0 || step >= mNumDenoiseSteps)
+                {
+                    LOG_ERROR("EDGELLM_ALPAMAYO_CACHE_STEPS: step %d must be in [1, %d)", step, mNumDenoiseSteps);
+                    throw std::runtime_error("invalid cached denoise step");
+                }
+                mCacheStep[static_cast<size_t>(step)] = true;
+            }
+            pos = end + 1;
+        }
+    }
+    int32_t const cached = static_cast<int32_t>(std::count(mCacheStep.begin(), mCacheStep.end(), true));
+    LOG_INFO("Alpamayo denoise schedule: %d steps, %d reuse the cached velocity", mNumDenoiseSteps, cached);
+}
+
 void Alpamayo1ActionRunner::allocateTensors(KVCacheManager::Config const& kvCacheConfig)
 {
+    parseDenoiseSchedule();
     Dims const maxNoise = mEngine->getProfileShape(binding_names::kNoiseTrajectory, 0, OptProfileSelector::kMAX);
     int32_t const maxBatch = std::min(static_cast<int32_t>(maxNoise.d[0]), kvCacheConfig.maxBatchSize);
     mMaxActionBatchSize = maxBatch;
@@ -496,9 +570,9 @@ void Alpamayo1ActionRunner::allocateTensors(KVCacheManager::Config const& kvCach
         {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "Alpamayo1ActionRunner::mTimeStepsT0Device");
     mTimeStepsT1Device = rt::Tensor(
         {1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "Alpamayo1ActionRunner::mTimeStepsT1Device");
-    mTimeStepsT0Host = rt::Tensor(std::vector<int64_t>{kNumDenoiseSteps}, rt::DeviceType::kCPU,
+    mTimeStepsT0Host = rt::Tensor(std::vector<int64_t>{mNumDenoiseSteps}, rt::DeviceType::kCPU,
         nvinfer1::DataType::kFLOAT, "Alpamayo1ActionRunner::mTimeStepsT0Host");
-    mTimeStepsT1Host = rt::Tensor(std::vector<int64_t>{kNumDenoiseSteps}, rt::DeviceType::kCPU,
+    mTimeStepsT1Host = rt::Tensor(std::vector<int64_t>{mNumDenoiseSteps}, rt::DeviceType::kCPU,
         nvinfer1::DataType::kFLOAT, "Alpamayo1ActionRunner::mTimeStepsT1Host");
 
     nvinfer1::Dims ropeCosSinDims = mContext->getTensorShape(binding_names::kRopeCosSin);

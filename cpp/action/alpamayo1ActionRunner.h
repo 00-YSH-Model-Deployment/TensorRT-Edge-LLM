@@ -120,8 +120,14 @@ public:
         tokenizer::Tokenizer const* tokenizer);
 
 private:
-    // Number of denoising steps run by the diffusion head
-    static constexpr int32_t kNumDenoiseSteps = 10;
+    // Number of denoising steps run by the diffusion head. 10 unless EDGELLM_ALPAMAYO_DENOISE_STEPS
+    // says otherwise; EDGELLM_ALPAMAYO_CACHE_STEPS (comma list, never 0) names the steps that reuse the
+    // last computed velocity instead of running the action engine (FlashDrive's action caching).
+    int32_t mNumDenoiseSteps{10};
+    std::vector<bool> mCacheStep{};
+
+    //! \brief Read the denoise step count and cached steps from the environment
+    void parseDenoiseSchedule();
 
     //! \brief Allocate tensors for the action runner
     void allocateTensors(KVCacheManager::Config const& kvCacheConfig);

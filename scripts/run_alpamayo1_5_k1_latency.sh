@@ -3,7 +3,8 @@
 #
 # Usage: L=<work dir holding inputs/ and engines/ from run_alpamayo1_5_thor.sh> bash $0
 # The converter writes each clip 6 times (batch 6, one noise per sample); this keeps one
-# copy per clip, cools the board to 50 C before each file and warms up 3 runs per file.
+# copy per clip, cools the board to 50 C before each file and warms up WARMUP runs (default 25,
+# about 60 s: the Thor GPU steps up only after ~40 s of load, so a few runs measure the slow state).
 # Results: $L/k1_outputs/{output,profile}_NNNN.json and .log.
 set -euo pipefail
 : "${L:?set L to the work dir}"
@@ -34,7 +35,7 @@ for f in "$L"/k1_inputs/input_*.json; do
     "$BUILD_DIR/examples/multimodal/action_inference" \
         --engineDir "$L/engines/llm" --multimodalEngineDir "$L/engines" \
         --inputFile "$f" --outputFile "$L/k1_outputs/output_$n.json" \
-        --warmup 3 --profileOutputFile "$L/k1_outputs/profile_$n.json" --dumpProfile \
+        --warmup "${WARMUP:-25}" --profileOutputFile "$L/k1_outputs/profile_$n.json" --dumpProfile \
         > "$L/k1_outputs/output_$n.log" 2>&1
     echo "file $n done $(date +%T)"
 done

@@ -25,6 +25,7 @@
 #include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
@@ -596,8 +597,27 @@ int main(int argc, char* argv[])
 
     try
     {
-        llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
-            loraWeightsMap, stream, rt::ContextCacheConfig{}, args.checkpointDir);
+        // EDGELLM_DFLASH_BLOCK=<n> runs the VLM with DFlash speculative decoding: the base engine in
+        // engineDir must be built with --specBase and the DFlash draft engine beside it (--specDraft).
+        // One draft pass proposes n tokens and the base verifies them in one forward (chain, top-1).
+        char const* dflashBlock = std::getenv("EDGELLM_DFLASH_BLOCK");
+        if (dflashBlock != nullptr && std::atoi(dflashBlock) > 0)
+        {
+            rt::SpecDecodeDraftingConfig draftingConfig;
+            draftingConfig.draftingTopK = 1;
+            draftingConfig.draftingStep = 1;
+            draftingConfig.dflashBlockSize = std::atoi(dflashBlock);
+            draftingConfig.verifySize = draftingConfig.dflashBlockSize;
+            LOG_INFO("DFlash speculative decoding enabled, block size %d", draftingConfig.dflashBlockSize);
+            llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir,
+                args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream, rt::ContextCacheConfig{},
+                args.checkpointDir);
+        }
+        else
+        {
+            llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir,
+                args.multimodalEngineDir, loraWeightsMap, stream, rt::ContextCacheConfig{}, args.checkpointDir);
+        }
     }
     catch (std::exception const& e)
     {
