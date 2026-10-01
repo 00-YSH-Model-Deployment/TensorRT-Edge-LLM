@@ -101,3 +101,27 @@ FP16 가중치 합계 = 15.17 + 1.28 + 1.16 + 4.56 ≈ **22.2 GB**. KV cache 409
   - `sudo apt install cmake build-essential cuda-toolkit-13-0 libnvinfer-dev libnvinfer-headers-dev libnvonnxparsers-dev python3.12-dev`
   - apt 의 TensorRT 는 10.13.3.9 (JetPack 7.1) 다. 그래서 action 엔진(TRT ≥ 10.15 연산)은 실패할 가능성이 그대로 남아 있다.
 - 폴더를 번호 구조로 정리하면서 추론 저장소가 `~/Documents/Alpamayo/11_Inference/YSH-Inference-Alpamayo-1.5` 로 옮겨졌다. `run_alpamayo1_5_thor.sh` 의 `INFER_REPO` 기본값도 이 경로로 바꿨다.
+
+## 2026-10-01 — Thor 엔진 빌드: TensorRT 10.13 에서 막히고 pip TensorRT 11 로 통과
+
+- **빌드 도구.** 사용자가 sudo 로 `cmake build-essential cuda-toolkit-13-0 libnvinfer-dev libnvinfer-headers-dev libnvonnxparsers-dev python3.12-dev` 를 설치했다. g++ 13.3, cmake 3.28, nvcc 13.0 이고, 시스템 TensorRT 는 10.13.3.9 다.
+- **스크립트 버그 두 건.**
+  - `build` 단계가 실행 파일 네 개만 빌드해서 플러그인 `NvInfer_edgellm_plugin` 이 없었다. 그래서 llm ONNX 파싱이 실패했다 ("Cannot open plugin library"). 빌드 대상에 플러그인을 추가했다.
+  - 플러그인 경로 기본값은 상대 경로 `build/libNvInfer_edgellm_plugin.so` 라 레포 루트에서만 풀린다. 스크립트가 `EDGELLM_PLUGIN_PATH` 를 절대 경로로 export 하게 했다.
+- **TensorRT 10.13 결과.** llm(15.2 GB)·visual(1.2 GB) 엔진은 약 3분에 빌드됐다. action 은 `TensorScatter`, `Attention` 노드에서 파싱이 실패했다(`checkFallbackPluginImporter`). TRT ≥ 10.15 가 필요하다는 예상이 맞았다.
+- **pip TensorRT 11.0 으로 우회 (sudo 없음).**
+  - pip `tensorrt-cu13-libs==11.0.0.114` 의 `.so` 에는 sm110 빌더 리소스, `libnvonnxparser`, `libnvinfer_plugin` 이 들어 있다.
+  - 여기에 GitHub `NVIDIA/TensorRT` 태그 `v11.0` 의 공개 헤더 13개를 합쳐 `~/Documents/Alpamayo/00_Model/TensorRT-11.0-pip/{include,lib}` 를 만들었다. `NvOnnxParser.h` 는 parsers/onnx 서브모듈 커밋의 것이다.
+  - 스크립트가 `TRT_PACKAGE_DIR`(기본 `/usr`)·`BUILD_DIR`(기본 `build`)를 받게 했다. `/usr` 가 아니면 그 `lib/` 를 `LD_LIBRARY_PATH` 에 넣는다.
+  - `TRT_PACKAGE_DIR=.../TensorRT-11.0-pip BUILD_DIR=$PWD/build-trt11` 로 `build engines` 를 돌렸다. 빌드부터 엔진까지 17분이고, 엔진 세 개가 모두 나왔다.
+- **1 clip 스모크 (021a4585, 6 sample, TRT 11).** 6개 모두 "Keep distance to the lead vehicle since it is slowing ahead" 로 PyTorch 와 같은 문장이었다. minADE6@3s 0.033 m, @6.4s 0.038 m.
+- **같은 clip 반복 프로파일** (`--warmup 6 --dumpProfile`). 반복하면 encoder embedding cache 가 맞아 vision 이 건너뛰어진다. 그래서 vision 시간은 이 숫자에 없다.
+
+  | 단계 | K=1 (batch 1) | K=6 (batch 6) | PyTorch 1.5 K=1 (baseline2) |
+  |---|---|---|---|
+  | prefill | 682 ms (3,086 tok) | 5,143 ms (18,516 tok, 프롬프트 6벌) | 1,064 ms |
+  | 디코드 step | 66.3 ms | 74.9 ms | 69.6 ms |
+  | action | 347 ms | 1,089 ms | 682 ms |
+  | 한 run 벽시계 | 약 2.1 s | 약 8.4–9.2 s | 3.52 s (vision 포함) |
+
+- 다음은 latency30 30 clip K=1 측정이다. clip 마다 이미지가 달라 vision 도 매번 돈다. PyTorch baseline2 와 같은 clip 이다.

@@ -21,10 +21,10 @@
 ## Phase 1 — Thor (2026-09-30 사용자 결정, A100 은 여유 없어 보류)
 
 - [x] ONNX — 복사 대신 Thor 에서 다시 export (2026-10-01, CPU 약 6분, `~/Documents/Alpamayo/00_Model/Alpamayo-1.5_EdgeLLM/onnx`, llm 16 GB / visual 1.1 GB / action 4.3 GB)
-- [ ] `check` — JetPack 의 TensorRT 가 10.15 이상인지 (미만이면 action_build 실패 가능)
-- [ ] `build` — C++ 빌드 (sm_110 CuTe DSL prebuilt 동봉, 커널 빌드 불필요)
-- [ ] `engines` — llm / visual / action, maxBatchSize 6
-- [ ] `LIMIT=1` 스모크 → CoC 텍스트와 궤적이 그럴듯한지, visual token 이 이미지당 180 인지
+- [x] `check` — JetPack 7.1 의 TensorRT 는 10.13.3.9 다. 예상대로 action 엔진만 실패했다 (TensorScatter / Attention 파싱 불가). pip TensorRT 11.0 으로 우회했다 (아래 노트)
+- [x] `build` — C++ 빌드. 플러그인 `NvInfer_edgellm_plugin` 이 빌드 대상에서 빠져 있어 추가했다. TensorRT 11 빌드는 `build-trt11/`
+- [x] `engines` — TensorRT 11 로 llm 16 GB / visual 1.1 GB / action 4.3 GB (`00_Model/Alpamayo-1.5_EdgeLLM/work-trt11/engines`)
+- [x] `LIMIT=1` 스모크 (clip 021a4585, 6 sample) → CoC 텍스트가 PyTorch 와 같은 문장, minADE6@6.4s 0.038 m. visual token 수는 미확인
 - [ ] `inputs` + `infer` + `score` — gold644 × 6 sample, minADE6
 - [ ] 같은 644 clip PyTorch 1.5 (`run_inference_tracked.py`) 와 분포 비교 + 지연
 

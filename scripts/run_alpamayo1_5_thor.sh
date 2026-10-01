@@ -34,7 +34,18 @@ CLIP_LIST="${CLIP_LIST:-$INFER_REPO/notebooks/clip_ids_gold644.parquet}"
 NUM_SAMPLES=6            # 엔진 maxBatchSize 와 입력 batch_size 가 같아야 한다
 KV_CAPACITY=4096         # export 의 --max-kv-cache-capacity 와 같아야 한다
 ENGINES="$WORK_DIR/engines"
-BIN="$REPO/build/examples"
+# TRT_PACKAGE_DIR picks the TensorRT to build against (JetPack's /usr by default); a
+# TensorRT other than the system one needs its own BUILD_DIR, and its lib/ on the
+# loader path at run time.
+TRT_PACKAGE_DIR="${TRT_PACKAGE_DIR:-/usr}"
+BUILD_DIR="${BUILD_DIR:-$REPO/build}"
+if [ "$TRT_PACKAGE_DIR" != /usr ]; then
+    export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+BIN="$BUILD_DIR/examples"
+# llm_build / action_inference load the attention plugins from this library. Its default is
+# the relative build/libNvInfer_edgellm_plugin.so, which resolves only from the repo root.
+export EDGELLM_PLUGIN_PATH="${EDGELLM_PLUGIN_PATH:-$BUILD_DIR/libNvInfer_edgellm_plugin.so}"
 
 need_gpu() {
     [ "${RUN_GPU:-0}" = "1" ] || { echo "GPU 단계다. RUN_GPU=1 을 붙여 실행한다." >&2; exit 1; }
@@ -53,15 +64,15 @@ stage_check() {
 stage_build() {
     local cuda; cuda="$(nvcc --version | grep -oE 'release [0-9]+\.[0-9]+' | cut -d' ' -f2)"
     git -C "$REPO" submodule update --init --recursive
-    cmake -S "$REPO" -B "$REPO/build" \
+    cmake -S "$REPO" -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DTRT_PACKAGE_DIR=/usr \
+        -DTRT_PACKAGE_DIR="$TRT_PACKAGE_DIR" \
         -DCMAKE_TOOLCHAIN_FILE="$REPO/cmake/aarch64_linux_toolchain.cmake" \
         -DEMBEDDED_TARGET=jetson-thor \
         -DCUDA_CTK_VERSION="$cuda" \
         -DENABLE_CUTE_DSL=ALL
-    cmake --build "$REPO/build" --parallel "$(nproc)" \
-        --target llm_build visual_build action_build action_inference
+    cmake --build "$BUILD_DIR" --parallel "$(nproc)" \
+        --target NvInfer_edgellm_plugin llm_build visual_build action_build action_inference
 }
 
 stage_engines() {
