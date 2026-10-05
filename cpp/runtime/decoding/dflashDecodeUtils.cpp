@@ -78,8 +78,6 @@ CachedBlockDraftRuntimeConfig makeCachedBlockDraftRuntimeConfig(DeploymentConfig
     ELLM_CHECK(deployment.draft->specDecodeType == userMode,
         "cached block draft base/draft modes must match: base=" + std::string(specDecodeModeName(userMode))
             + ", draft=" + specDecodeModeName(deployment.draft->specDecodeType) + ".");
-    ELLM_CHECK(deployment.base.reducedVocabSize == 0,
-        std::string(specDecodeModeName(userMode)) + " does not support reduced-vocabulary base engines.");
 
     auto const& spec = *deployment.specConfig;
     CachedBlockDraftRuntimeConfig cfg;

@@ -966,6 +966,30 @@ TEST_F(DeploymentConfigTest, DFlashLinearRuntimeConfigIsBidirectional)
     EXPECT_EQ(cfg.draftVocabSize, 32000);
 }
 
+TEST_F(DeploymentConfigTest, DFlashReducedVocabBaseRuntimeConfigValidatesOk)
+{
+    Json baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    baseJson["reduced_vocab_size"] = 4096;
+    draftJson["reduced_vocab_size"] = 4096;
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 0;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+    EXPECT_EQ(bundle.base.vocabSize, 32000);
+    EXPECT_EQ(bundle.base.outputVocabSize, 4096);
+
+    auto const cfg = dflash_utils::makeCachedBlockDraftRuntimeConfig(bundle);
+    EXPECT_EQ(cfg.treePolicy, dflash_utils::BlockDraftTreePolicy::kLinear);
+    EXPECT_EQ(cfg.draftVocabSize, 4096);
+}
+
 TEST_F(DeploymentConfigTest, JetSpecDDTreeRuntimeConfigIsCausal)
 {
     Json baseJson = makeDenseJetSpecBaseConfig(/*maxVerify=*/128);

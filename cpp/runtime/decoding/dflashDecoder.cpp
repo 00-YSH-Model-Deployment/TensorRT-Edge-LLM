@@ -254,6 +254,17 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
         LOG_INFO("DFlashDecoder: draft vocab map loaded (%d reduced -> full vocab tokens)",
             static_cast<int32_t>(mDraftVocabMappingTable.getShape()[0]));
     }
+
+    if (baseCfg.reducedVocabSize > 0)
+    {
+        Tensor const& baseVocabMap = mRuntime.sampling.baseVocabMappingTable;
+        ELLM_CHECK(baseVocabMap.getShape().getNumDims() == 1 && baseVocabMap.getShape()[0] == baseCfg.reducedVocabSize,
+            std::string(userModeName()) + " reduced-vocabulary base requires a loaded "
+                + binding_names::kVocabMapFileName + " with " + std::to_string(baseCfg.reducedVocabSize)
+                + " entries.");
+        LOG_INFO("DFlashDecoder: base lm_head uses a reduced vocabulary (%d ids); verify top-1 is mapped to full ids",
+            baseCfg.reducedVocabSize);
+    }
 }
 
 bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
@@ -709,12 +720,17 @@ bool DFlashDecoder::runBaseVerification(DecodingInferenceContext& context)
     // GCOVR_EXCL_STOP
 
     Tensor const& acceptTokenIds = useDDTree() ? mTreeTokenIds : mVerifyTokenIds;
+    // Proposal ids (draft or external) are full-vocab ids, so a reduced-vocabulary base's top-1 is mapped to
+    // full-vocab ids before matching; accepted ids, including the bonus token, are full-vocab ids.
+    OptionalInputTensor const baseVocabMap = (mRuntime.deployment.base.reducedVocabSize > 0)
+        ? std::optional{std::ref(mRuntime.sampling.baseVocabMappingTable)}
+        : std::nullopt;
     // DFlash reuses the EAGLE accept utility for both linear-tree and branching-tree verification:
     // Step 1: compute base top-1 tokens for every verify node from base logits.
     // Step 2: accept the selected token and record the verify-node index.
     // Step 3: follow the next matching child through the verify tree mask.
     kernel::eagleAccept(mRuntime.base.pipelineIO.outputLogits, acceptTokenIds, mVerifyTreeMask, mAcceptedTokenIds,
-        mAcceptedTokenIndices, mAcceptLength, std::nullopt, mRuntime.sampling.workspace.rawPointer(),
+        mAcceptedTokenIndices, mAcceptLength, baseVocabMap, mRuntime.sampling.workspace.rawPointer(),
         mRuntime.sampling.workspace.getMemoryCapacity(), context.stream);
     if (!checkCudaLastError("accept"))
     {

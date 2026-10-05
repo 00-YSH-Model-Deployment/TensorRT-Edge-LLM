@@ -120,10 +120,22 @@ tensorrt-edgellm-export \
   --dflash-draft-dir Qwen3.5-4B-DFlash \
   --draft-reduced-vocab-dir draft_reduced_vocab/
 
-# The base model export (--dflash-base) is unchanged; reduction is draft-only.
+# Draft-only reduction leaves the base model export (--dflash-base) unchanged.
 ```
 
 The export writes `draft_vocab_map.safetensors` next to the draft engine. At runtime, `DFlashDecoder` gates on the draft engine config's `reduced_vocab_size > 0`: a missing map file when the config declares reduction is a hard error, and a stray map file when the config does not declare reduction is ignored. Base-model vocab reduction and draft-model vocab reduction are orthogonal and can be combined.
+
+The DFlash/JetSpec **base** can be reduced as well, which shrinks the LM head read on every verify pass. Export it with `--dflash-base` (or `--jetspec-base`) and `--reduced-vocab-dir <dir>`; the export writes `vocab_map.safetensors` with the ONNX model and the engine build copies it next to `spec_base.engine`. `DFlashDecoder` maps the base's verify top-1 to full-vocabulary IDs before acceptance, so draft proposals (already remapped from the draft vocabulary) and any external proposals are compared in full-vocabulary IDs, and accepted tokens are emitted in full-vocabulary IDs. A proposed token outside the base's kept set can never be accepted, so reuse the draft's map (or a superset of it) for the base. Greedy output only matches the full-vocabulary base when every token the full base would emit is in the kept set.
+
+```bash
+# Base with the same reduced vocabulary as the draft
+tensorrt-edgellm-export \
+  Qwen/Qwen3.5-4B \
+  qwen3_5_4b/onnx/base_export \
+  --dflash-base \
+  --dflash-draft-dir Qwen3.5-4B-DFlash \
+  --reduced-vocab-dir draft_reduced_vocab/
+```
 
 ---
 
