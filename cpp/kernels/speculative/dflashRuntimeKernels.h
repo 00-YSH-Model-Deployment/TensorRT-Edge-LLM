@@ -122,5 +122,19 @@ void launchDFlashBuildLinearVerifyInputs(int32_t const* lastAcceptedTokens, int3
     int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t proposalLen, int32_t draftTokenStride,
     int32_t verifySize, cudaStream_t stream);
 
+/// Launch kernel to force a fixed successor token in DFlash linear verify rows.
+///
+/// For each batch row, every slot j >= 1 whose predecessor j - 1 held triggerToken on entry is overwritten with
+/// forcedToken. Slot 0 (the last accepted token) is read but never written, so a trigger anchor forces slot 1.
+///
+/// @param verifyTokenIds [B, verifySize] INT32 — linear verify token IDs, updated in place
+/// @param batchSize batch size
+/// @param verifySize verify row length
+/// @param triggerToken token whose successor slot is overwritten
+/// @param forcedToken token written to that slot
+/// @param stream CUDA stream
+void launchDFlashForceSuccessorToken(int32_t* verifyTokenIds, int32_t batchSize, int32_t verifySize,
+    int32_t triggerToken, int32_t forcedToken, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

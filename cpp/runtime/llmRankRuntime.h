@@ -374,6 +374,20 @@ private:
     };
     TemporalDraftState mTemporalDraft;
 
+    //! Trajectory-start guard (EDGELLM_DFLASH_FORCE_TRAJ_START=1, DFlash linear verify, Alpamayo requests):
+    //! DFlash verifies <|traj_future_start|> right after a drafted or anchor <|cot_end|>, so the token the finish
+    //! rule waits for enters the KV in the same round (DecodingInferenceContext::trajFutureStartId).
+    struct TrajStartGuard
+    {
+        int32_t cotEndId{-1};
+        int32_t trajFutureStartId{-1};
+        bool enabled() const noexcept
+        {
+            return cotEndId >= 0 && trajFutureStartId >= 0;
+        }
+    };
+    TrajStartGuard mTrajStartGuard;
+
     //! Vision blocks ([VS] image tokens [VE]) of a prompt, in prompt order.
     std::vector<std::pair<int32_t, int32_t>> findFrameBlocks(std::vector<int32_t> const& ids) const;
     //! Whether this request can reuse the resident KV under streaming prefill.

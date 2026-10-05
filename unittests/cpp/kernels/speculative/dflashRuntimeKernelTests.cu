@@ -238,3 +238,23 @@ TEST(DFlashRuntimeKernels, BuildLinearVerifyInputsUsesDraftStrideForBatchRows)
     }
     EXPECT_EQ(copyDeviceToHost<int8_t>(verifyTreeMask), expectedMask);
 }
+
+TEST(DFlashRuntimeKernels, ForceSuccessorTokenFollowsAnchorAndProposals)
+{
+    cudaStream_t stream = nullptr;
+    constexpr int32_t batchSize = 3;
+    constexpr int32_t verifySize = 5;
+    constexpr int32_t trigger = 7;
+    constexpr int32_t forced = 9;
+
+    auto verifyTokenIds = rt::Tensor({batchSize, verifySize}, rt::DeviceType::kGPU, DataType::kINT32);
+    // Row 0: trigger anchor. Row 1: consecutive triggers match as drafted. Row 2: a trigger in the last slot.
+    copyHostToDevice<int32_t>(verifyTokenIds, {7, 1, 2, 3, 4, 10, 7, 5, 7, 7, 11, 1, 2, 3, 7});
+
+    kernel::launchDFlashForceSuccessorToken(
+        verifyTokenIds.dataPointer<int32_t>(), batchSize, verifySize, trigger, forced, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(verifyTokenIds),
+        (std::vector<int32_t>{7, 9, 2, 3, 4, 10, 7, 9, 7, 9, 11, 1, 2, 3, 7}));
+}

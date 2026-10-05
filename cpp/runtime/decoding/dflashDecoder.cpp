@@ -273,15 +273,21 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
     cudaGetLastError();
 
     int32_t external = 0;
+    bool hostProposal = false;
     {
         TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
         bool const usePendingPrefillProposal
             = mCommonStateTracker.shouldUsePendingPrefillProposal(context.generationRound);
         if (!usePendingPrefillProposal)
         {
-            external = stageExternalDraft(context);
+            hostProposal = stageTrajStartProposal(context);
+            if (!hostProposal)
+            {
+                external = stageExternalDraft(context);
+                hostProposal = external > 0;
+            }
         }
-        if (external > 0)
+        if (hostProposal)
         {
             // The draft engine is skipped, but its context window must still take this round's target rows:
             // the next verify overwrites baseHiddenStates.
@@ -293,7 +299,7 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
             return false;
         }
         mCommonStateTracker.materializePending(context.generationRound, context.activeBatchSize);
-        if (!prepareBlockDraftVerifyInputs(context, external > 0))
+        if (!prepareBlockDraftVerifyInputs(context, hostProposal))
         {
             LOG_ERROR("DFlashDecoder: verify input preparation failed.");
             return false;
@@ -526,6 +532,40 @@ int32_t DFlashDecoder::stageExternalDraft(DecodingInferenceContext& context)
     return proposed;
 }
 
+bool DFlashDecoder::stageTrajStartProposal(DecodingInferenceContext& context)
+{
+    // Window mode only, as for stageExternalDraft: a skipped draft step leaves no stale draft KV there.
+    if (context.trajFutureStartId < 0 || useDDTree() || mContextWindow == 0)
+    {
+        return false;
+    }
+    int32_t const activeBatchSize = context.activeBatchSize;
+    int32_t const BS = mBlockDraft.blockSize;
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        int32_t const anchor = context.tokenIds[b].back();
+        if (anchor != context.cotEndId && anchor != context.trajFutureStartId)
+        {
+            return false;
+        }
+    }
+    check::check(mHostExternalDraft.reshape({activeBatchSize, BS}), "Tensor reshape failed");
+    int32_t* host = mHostExternalDraft.dataPointer<int32_t>();
+    std::fill(host, host + activeBatchSize * BS, mBlockDraft.maskTokenId);
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        // A <|traj_future_start|> anchor enters the KV in this verify, so nothing after it is kept.
+        if (context.tokenIds[b].back() == context.cotEndId)
+        {
+            host[b * BS + 1] = context.trajFutureStartId;
+        }
+    }
+    check::check(mDraftTokenIds.reshape({activeBatchSize, BS}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(mDraftTokenIds.rawPointer(), host, activeBatchSize * BS * sizeof(int32_t),
+        cudaMemcpyHostToDevice, context.stream));
+    return true;
+}
+
 bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& context, bool externalDraft)
 {
     NVTX_SCOPED_RANGE(
@@ -565,6 +605,11 @@ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& cont
             mDraftTokenIds.dataPointer<int32_t>(), mVerifyTokenIds.dataPointer<int32_t>(),
             mVerifyTreeMask.dataPointer<int8_t>(), activeBatchSize, mBlockDraft.proposalLen, mBlockDraft.blockSize,
             verifySize, context.stream);
+        if (context.trajFutureStartId >= 0)
+        {
+            kernel::launchDFlashForceSuccessorToken(mVerifyTokenIds.dataPointer<int32_t>(), activeBatchSize,
+                verifySize, context.cotEndId, context.trajFutureStartId, context.stream);
+        }
         prepareLinearBaseVerificationMetadata(activeBatchSize, verifySize, context.stream);
     }
     else if (!buildTreeVerifyInputs(context))

@@ -654,6 +654,16 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         LOG_INFO("Temporal draft %s (min match %d, %d frames per camera)", mTemporalDraft.enabled ? "on" : "off",
             mTemporalDraft.minMatch, mStreaming.framesPerView);
     }
+    if (char const* force = std::getenv("EDGELLM_DFLASH_FORCE_TRAJ_START"))
+    {
+        if (std::atoi(force) != 0)
+        {
+            mTrajStartGuard.cotEndId = static_cast<int32_t>(mTokenizer->getTokenId("<|cot_end|>"));
+            mTrajStartGuard.trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
+        }
+        LOG_INFO("DFlash trajectory-start guard %s (<|cot_end|> %d, <|traj_future_start|> %d)",
+            mTrajStartGuard.enabled() ? "on" : "off", mTrajStartGuard.cotEndId, mTrajStartGuard.trajFutureStartId);
+    }
 
     if (contextCacheConfig.enabled)
     {
@@ -1597,6 +1607,21 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
                 generated, mTemporalDraft.minMatch, out, capacity);
         };
     }
+    if (mTrajStartGuard.enabled() && hasActionRequest
+        && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1
+        && decodingStrategy.kind() == DecodingStrategyKind::kDFlash
+        && std::all_of(request.requests.begin(), request.requests.end(),
+            [](auto const& req) { return req.pastTrajectory.has_value(); }))
+    {
+        context.cotEndId = mTrajStartGuard.cotEndId;
+        context.trajFutureStartId = mTrajStartGuard.trajFutureStartId;
+    }
+
+    // Per-sequence summary for speculative strategies: decode rounds, the final round's anchor (the token it
+    // verified first) and its accept length (tokens appended, the base model's own token included).
+    bool const logDecodeRounds = decodingStrategy.isSpeculative();
+    std::vector<int32_t> roundAnchors;
+    std::vector<int32_t> roundAcceptLengths;
 
     while (!checkAllFinished())
     {
@@ -1614,16 +1639,48 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
             return false;
         }
 
+        if (logDecodeRounds)
+        {
+            roundAnchors.resize(context.activeBatchSize);
+            roundAcceptLengths.resize(context.activeBatchSize);
+            for (int32_t i = 0; i < context.activeBatchSize; ++i)
+            {
+                roundAnchors[i] = context.tokenIds[i].empty() ? -1 : context.tokenIds[i].back();
+                roundAcceptLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
+            }
+        }
+
         if (!decodingStrategy.decodeStep(context))
         {
             LOG_ERROR("Failed to decode tokens with %s decoding strategy.", decodingStrategy.name());
             return false;
         }
 
+        if (logDecodeRounds)
+        {
+            for (int32_t i = 0; i < context.activeBatchSize; ++i)
+            {
+                roundAcceptLengths[i] = static_cast<int32_t>(context.tokenIds[i].size()) - roundAcceptLengths[i];
+            }
+        }
+
         // Per-iter pipeline: decode -> finalize finish state -> emit chunks.
         decodePerSlot(context, *mTokenizer);
         updateThinkingDone();
         updateFinishStates();
+
+        if (logDecodeRounds)
+        {
+            for (int32_t i = 0; i < context.activeBatchSize; ++i)
+            {
+                if (context.finishedStates[i])
+                {
+                    LOG_INFO("Decode: request %d finished in %d rounds; final round anchor %d, accept length %d",
+                        context.batchIndexMapping[i], context.generationRound + 1, roundAnchors[i],
+                        roundAcceptLengths[i]);
+                }
+            }
+        }
 
         std::vector<int32_t> const& commonMaterializedStateLengths = decodingStrategy.commonMaterializedStateLengths();
         if (managedRequest != nullptr && !managedRequest->completeDecodeStep(context, commonMaterializedStateLengths))

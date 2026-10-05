@@ -86,6 +86,10 @@ private:
     //! Asks context.externalDraft for this step's proposal and uploads it to mDraftTokenIds; returns the number
     //! of proposed tokens, 0 to leave the step to the draft engine.
     int32_t stageExternalDraft(DecodingInferenceContext& context);
+    //! Trajectory-start guard (context.trajFutureStartId >= 0): when every anchor is <|cot_end|> or
+    //! <|traj_future_start|>, uploads [<|traj_future_start|>] or no proposal to mDraftTokenIds and returns true, so
+    //! the draft engine is skipped; generation stops once <|traj_future_start|> is in the KV.
+    bool stageTrajStartProposal(DecodingInferenceContext& context);
     bool prepareBlockDraftVerifyInputs(DecodingInferenceContext& context, bool externalDraft = false);
     bool captureDraftCudaGraphs(cudaStream_t stream);
     bool buildTreeVerifyInputs(DecodingInferenceContext& context);

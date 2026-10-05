@@ -402,5 +402,48 @@ void launchDFlashBuildLinearVerifyInputs(int32_t const* lastAcceptedTokens, int3
     CUDA_CHECK(cudaGetLastError());
 }
 
+// -----------------------------------------------------------------------
+// DFlash linear verification successor forcing
+// -----------------------------------------------------------------------
+//
+// Grid: ceil(batchSize / 128)
+// Block: 128, one thread per batch row
+
+__global__ void dflashForceSuccessorTokenKernel(int32_t* __restrict__ verifyTokenIds, int32_t batchSize,
+    int32_t verifySize, int32_t triggerToken, int32_t forcedToken)
+{
+    int32_t const b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batchSize)
+    {
+        return;
+    }
+    int32_t* row = verifyTokenIds + static_cast<int64_t>(b) * verifySize;
+    int32_t previous = row[0];
+    for (int32_t j = 1; j < verifySize; ++j)
+    {
+        int32_t const current = row[j];
+        if (previous == triggerToken)
+        {
+            row[j] = forcedToken;
+        }
+        previous = current;
+    }
+}
+
+void launchDFlashForceSuccessorToken(int32_t* verifyTokenIds, int32_t batchSize, int32_t verifySize,
+    int32_t triggerToken, int32_t forcedToken, cudaStream_t stream)
+{
+    if (batchSize == 0 || verifySize < 2)
+    {
+        return;
+    }
+
+    constexpr int32_t kThreadsPerBlock{128};
+    int32_t const blocks = (batchSize + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    dflashForceSuccessorTokenKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+        verifyTokenIds, batchSize, verifySize, triggerToken, forcedToken);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

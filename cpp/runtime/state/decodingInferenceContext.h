@@ -151,6 +151,12 @@ struct DecodingInferenceContext
     int32_t externalDraftProposed{0}; //!< External tokens proposed in those rounds
     int32_t externalDraftAccepted{0}; //!< External tokens the base model confirmed
 
+    //! Alpamayo trajectory-start guard for linear DFlash, -1 when off. Generation stops once <|traj_future_start|>
+    //! is in the KV, so every verify slot after a <|cot_end|> carries <|traj_future_start|>, and a step whose
+    //! anchors are all one of the two skips the draft engine.
+    int32_t cotEndId{-1};
+    int32_t trajFutureStartId{-1};
+
     //! Few-layer-validation debug: per-request layer dumper (null unless the
     //! EDGELLM_DUMP_LOGITS_KVCACHE_* env vars are set). Owned here via RAII so it shares the
     //! context's lifetime exactly; see the out-of-line destructor. Also carries optional

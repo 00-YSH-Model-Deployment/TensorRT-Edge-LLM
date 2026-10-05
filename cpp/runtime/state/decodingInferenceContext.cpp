@@ -59,6 +59,8 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     externalDraftRounds = 0;
     externalDraftProposed = 0;
     externalDraftAccepted = 0;
+    cotEndId = -1;
+    trajFutureStartId = -1;
 
     batchIndexMapping.resize(batchSize);
     for (int32_t i = 0; i < batchSize; ++i)
