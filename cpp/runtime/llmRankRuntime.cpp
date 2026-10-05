@@ -55,6 +55,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -69,6 +70,9 @@ namespace
 //! into the engines by `llmBuilder`.
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
+//! Host threads hashing a request's images for the encoder cache. A request's frames are hashed one per task and
+//! the hash is compute-bound per thread, so more threads help until the CPU's memory bandwidth is the limit.
+constexpr int32_t kDEFAULT_MEDIA_HASH_THREADS{8};
 
 } // namespace
 
@@ -713,9 +717,20 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
     {
         auto const budgetBytes = contextCacheConfig.encoderEmbeddingCacheBudgetBytes;
-        mEncoderEmbeddingCache = std::make_unique<EncoderEmbeddingCache>(budgetBytes);
-        LOG_INFO("Encoder embedding cache initialized with %zu MiB budget.",
-            static_cast<size_t>(budgetBytes / (1024 * 1024)));
+        // EDGELLM_ENCODER_CACHE_POOL=0 gives every entry its own cudaMalloc; its cudaFree on eviction may wait for
+        // the device.
+        char const* const pool = std::getenv("EDGELLM_ENCODER_CACHE_POOL");
+        bool const streamOrdered = pool == nullptr || std::atoi(pool) != 0;
+        mEncoderEmbeddingCache = std::make_unique<EncoderEmbeddingCache>(budgetBytes, streamOrdered);
+        int32_t hashThreads = std::min(
+            kDEFAULT_MEDIA_HASH_THREADS, static_cast<int32_t>(std::max(1U, std::thread::hardware_concurrency())));
+        if (char const* threads = std::getenv("EDGELLM_MEDIA_HASH_THREADS"))
+        {
+            hashThreads = std::max(1, std::atoi(threads));
+        }
+        mMediaHasher = std::make_unique<OpaqueIdentityHasher>(hashThreads);
+        LOG_INFO("Encoder embedding cache initialized with %zu MiB budget (%s entries, %d hashing threads).",
+            static_cast<size_t>(budgetBytes / (1024 * 1024)), streamOrdered ? "pooled" : "cudaMalloc", hashThreads);
     }
 }
 
@@ -2185,6 +2200,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
         if (mEncoderEmbeddingCache)
         {
             bool hashable = true;
+            std::vector<std::string_view> imageBytes;
             for (auto const& req : request.requests)
             {
                 for (auto const& img : req.imageBuffers)
@@ -2193,7 +2209,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
                     {
                         auto const* rawPtr = reinterpret_cast<char const*>(img.data());
                         size_t const rawBytes = static_cast<size_t>(img.bytesPerFrame()) * img.frames;
-                        imageHashes.push_back(hashOpaqueIdentity(std::string_view(rawPtr, rawBytes)));
+                        imageBytes.emplace_back(rawPtr, rawBytes);
                         images.push_back(&img);
                     }
                     else
@@ -2202,9 +2218,9 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
                     }
                 }
             }
-            if (!hashable)
+            if (hashable)
             {
-                imageHashes.clear();
+                imageHashes = mMediaHasher->hash(imageBytes);
             }
         }
 

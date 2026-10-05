@@ -306,6 +306,7 @@ private:
     std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
     tokenizer::Tokenizer* mTokenizer{nullptr};                     //!< Shared tokenizer owned by RuntimeCoordinator
     std::unique_ptr<EncoderEmbeddingCache> mEncoderEmbeddingCache; //!< Content-addressed encoder output cache
+    std::unique_ptr<OpaqueIdentityHasher> mMediaHasher;            //!< Image keys of the encoder cache
     std::vector<rt::Tensor> mVisionCacheScratch; //!< Per-level rows of images encoded on a partial cache hit
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase;          //!< System prompt KVCache for base model

@@ -21,9 +21,14 @@
 #include "runtime/state/contextCache/blockHash.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <optional>
+#include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -45,12 +50,25 @@ struct EncoderEmbeddingCacheEntry
 //! subsequent requests with identical media to skip the expensive encoder `infer()` call.
 //! Eviction is LRU when the GPU memory budget is exceeded.
 //!
+//! With a stream-ordered pool, eviction frees an entry on the storing stream without synchronizing, and a later store
+//! on that stream may reuse its memory. A looked-up entry must therefore be read on the stream that stores next, with
+//! the reads enqueued before that store.
+//!
 //! Thread safety: inherits the single-writer contract from ContextCacheManager. No internal mutex.
 class EncoderEmbeddingCache
 {
 public:
     //! Construct with a GPU memory budget in bytes. A budget of 0 disables the cache.
-    explicit EncoderEmbeddingCache(int64_t maxBudgetBytes);
+    //! @param streamOrdered Back entries with a stream-ordered memory pool that keeps freed memory. When false, or
+    //!        when the device has no memory pools, each entry owns a cudaMalloc allocation whose cudaFree on
+    //!        eviction may synchronize the device.
+    explicit EncoderEmbeddingCache(int64_t maxBudgetBytes, bool streamOrdered = true);
+    ~EncoderEmbeddingCache() noexcept;
+
+    EncoderEmbeddingCache(EncoderEmbeddingCache const&) = delete;
+    EncoderEmbeddingCache& operator=(EncoderEmbeddingCache const&) = delete;
+    EncoderEmbeddingCache(EncoderEmbeddingCache&&) = delete;
+    EncoderEmbeddingCache& operator=(EncoderEmbeddingCache&&) = delete;
 
     //! Look up a cached embedding by content hash.
     //! Returns a const reference to the cached tensor on hit, std::nullopt on miss.
@@ -71,7 +89,7 @@ public:
     void storeSlice(Hash128 key, void const* devicePtr, int64_t numTokens, int64_t hiddenSize, nvinfer1::DataType dtype,
         cudaStream_t stream);
 
-    //! Remove all entries and free GPU memory.
+    //! Remove all entries and free GPU memory. Waits for the device when entries come from the pool.
     void clear();
 
     //! Current GPU bytes used by cached embeddings.
@@ -87,11 +105,44 @@ public:
     }
 
 private:
-    void evictUntilFits(int64_t requiredBytes);
+    void evictUntilFits(int64_t requiredBytes, cudaStream_t stream);
 
     int64_t mBudgetBytes;
     int64_t mUsedBytes{};
     std::unordered_map<Hash128, EncoderEmbeddingCacheEntry> mEntries;
+    cudaMemPool_t mPool{nullptr}; //!< Backs every entry when set; entries then hold non-owning tensors
+};
+
+//! Hashes media buffers with hashOpaqueIdentity, one buffer per task, on a fixed set of host threads.
+//!
+//! The calling thread hashes as well, so `numThreads` includes it and 1 starts no thread. One caller at a time.
+class OpaqueIdentityHasher
+{
+public:
+    explicit OpaqueIdentityHasher(int32_t numThreads);
+    ~OpaqueIdentityHasher();
+
+    OpaqueIdentityHasher(OpaqueIdentityHasher const&) = delete;
+    OpaqueIdentityHasher& operator=(OpaqueIdentityHasher const&) = delete;
+    OpaqueIdentityHasher(OpaqueIdentityHasher&&) = delete;
+    OpaqueIdentityHasher& operator=(OpaqueIdentityHasher&&) = delete;
+
+    //! hashOpaqueIdentity of each item, in item order.
+    std::vector<Hash128> hash(std::vector<std::string_view> const& items);
+
+private:
+    void workerLoop();
+
+    std::mutex mMutex;
+    std::condition_variable mWork;     //!< Items to claim, or shutdown
+    std::condition_variable mFinished; //!< The last item of the current call is done
+    std::vector<std::string_view> const* mItems{nullptr};
+    Hash128* mResults{nullptr};
+    size_t mCount{};     //!< Items of the current call, 0 between calls
+    size_t mNextItem{};  //!< Next unclaimed item
+    size_t mDoneItems{}; //!< Items whose result is written
+    bool mStop{false};
+    std::vector<std::thread> mWorkers;
 };
 
 } // namespace rt
