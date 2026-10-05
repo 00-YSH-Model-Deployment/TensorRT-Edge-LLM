@@ -608,16 +608,25 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
             LOG_INFO("Failed to load Action runner from %s: %s", (multimodalEngineDir + "/action").c_str(), e.what());
         }
 
-        // Validate that the action engine's max KV cache capacity matches the LLM engine's.
+        // The action engine gathers the LLM's paged KV into its own head-major buffers, so its capacity may be
+        // below the LLM's (each request is checked against it in sampleTrajectory) but must stay within the
+        // page-table row the gather indexes.
         if (mActionRunner)
         {
             int32_t const actionMaxKVCacheCapacity = mActionRunner->getMaxKVCacheCapacity();
             int32_t const llmMaxKVCacheCapacity = mDeployment.base.maxKVCacheCapacity;
-            ELLM_CHECK(actionMaxKVCacheCapacity == llmMaxKVCacheCapacity,
-                format::fmtstr(
-                    "Action engine max_kv_cache_capacity (%d) does not match LLM engine max_kv_cache_capacity (%d). "
-                    "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
-                    actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
+            int32_t const pageTableCapacity = mSharedResources->kvPageTables[0]->maxPagesPerSeq() * kTOKENS_PER_PAGE;
+            ELLM_CHECK(actionMaxKVCacheCapacity > 0 && actionMaxKVCacheCapacity <= pageTableCapacity,
+                format::fmtstr("Action engine max_kv_cache_capacity (%d) must be in [1, %d], the page-aligned "
+                               "capacity of the LLM engine (max_kv_cache_capacity %d).",
+                    actionMaxKVCacheCapacity, pageTableCapacity, llmMaxKVCacheCapacity));
+            if (actionMaxKVCacheCapacity < llmMaxKVCacheCapacity)
+            {
+                LOG_INFO(
+                    "Action engine KV capacity %d is below the LLM's %d; action requests must keep their KV "
+                    "length plus the action tokens within it.",
+                    actionMaxKVCacheCapacity, llmMaxKVCacheCapacity);
+            }
         }
     }
 

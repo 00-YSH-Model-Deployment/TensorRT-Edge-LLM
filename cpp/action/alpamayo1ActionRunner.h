@@ -196,7 +196,8 @@ private:
 
     int32_t mNumWaypoints{64};
     int64_t mRopeHeadDim{128};
-    int32_t mMaxSequenceLength{0};
+    //! Sequence dimension of the action engine's KV inputs; may be smaller than the LLM KV capacity.
+    int32_t mKVCacheCapacity{0};
     //! Allocated max batch for action staging (min of engine profile and KV cache maxBatchSize).
     int32_t mMaxActionBatchSize{0};
     std::vector<rt::Tensor> mKCacheLayers;

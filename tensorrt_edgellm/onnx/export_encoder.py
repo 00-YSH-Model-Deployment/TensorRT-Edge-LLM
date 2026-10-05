@@ -515,7 +515,9 @@ def export_action_onnx(
         weights:     Flat ``{key: tensor}`` dict from safetensors (must include
                      ``expert.*``, ``action_in_proj.*``, ``action_out_proj.*``).
         config:      :class:`~config.ActionConfig` with expert hyperparameters.
-        max_kv_cache_capacity: Fixed KV cache capacity (must match LLM engine).
+        max_kv_cache_capacity: Fixed KV cache capacity. May be below the LLM
+                     engine's; it must hold the longest prompt plus generated
+                     tokens plus ``n_diffusion_tokens``.
         dtype:       Weight dtype (default ``float16``).
         model_config: Top-level ``ModelConfig`` of a checkpoint whose expert
                      projections are quantized; ``None`` exports FP16.

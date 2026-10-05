@@ -39,7 +39,8 @@ struct ActionBuilderConfig
     //! Maximum batch size for dynamic batch dimensions.
     int32_t maxBatchSize{4};
 
-    //! Maximum KV cache capacity (must match the LLM engine's maxKVCacheCapacity).
+    //! KV cache capacity of the action ONNX (read from its k_cache inputs). It may be below the LLM engine's
+    //! maxKVCacheCapacity as long as every action request's KV length plus n_diffusion_tokens fits.
     int32_t maxKVCacheCapacity{0};
 
     //! Convert configuration to JSON format for serialization.

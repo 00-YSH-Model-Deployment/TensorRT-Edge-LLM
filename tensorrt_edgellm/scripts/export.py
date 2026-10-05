@@ -3642,6 +3642,13 @@ def _export_action(model_dir: str,
     logger.info("[Action] Expert: %d layers, %d heads, hidden=%d",
                 action_cfg.num_hidden_layers, action_cfg.num_attention_heads,
                 action_cfg.hidden_size)
+    if max_kv_cache_capacity <= action_cfg.n_diffusion_tokens:
+        logger.error(
+            "[Action] --max-kv-cache-capacity %d must exceed the %d action "
+            "tokens the expert appends to the KV cache", max_kv_cache_capacity,
+            action_cfg.n_diffusion_tokens)
+        raise SystemExit(1)
+    logger.info("[Action] KV cache capacity: %d", max_kv_cache_capacity)
 
     logger.info("[Action] Exporting to %s", output_path)
     try:
@@ -4040,7 +4047,10 @@ def main() -> None:
         type=int,
         default=4096,
         help=
-        "Max KV cache capacity for action expert (Alpamayo). Default: 4096.",
+        ("KV cache capacity of the action expert (Alpamayo). It may be below "
+         "the LLM engine's --maxKVCacheCapacity but must cover the longest "
+         "prompt plus generated tokens plus n_diffusion_tokens. Re-export only "
+         "the expert with --components action. Default: 4096."),
     )
     p.add_argument(
         "--skip-action",

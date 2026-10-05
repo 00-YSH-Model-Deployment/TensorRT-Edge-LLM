@@ -32,7 +32,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 INFER_REPO="${INFER_REPO:-$HOME/Documents/Alpamayo/11_Inference/YSH-Inference-Alpamayo-1.5}"
 CLIP_LIST="${CLIP_LIST:-$INFER_REPO/notebooks/clip_ids_gold644.parquet}"
 NUM_SAMPLES=6            # 엔진 maxBatchSize 와 입력 batch_size 가 같아야 한다
-KV_CAPACITY=4096         # export 의 --max-kv-cache-capacity 와 같아야 한다
+KV_CAPACITY=4096         # LLM 엔진 용량. export 의 --max-kv-cache-capacity (action) 는 이보다 작아도 된다
 ENGINES="$WORK_DIR/engines"
 # TRT_PACKAGE_DIR picks the TensorRT to build against (JetPack's /usr by default); a
 # TensorRT other than the system one needs its own BUILD_DIR, and its lib/ on the

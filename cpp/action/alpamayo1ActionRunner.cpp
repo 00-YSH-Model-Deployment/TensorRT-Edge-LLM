@@ -232,7 +232,7 @@ void Alpamayo1ActionRunner::setDynamicInputShapes(int32_t activeBatchSize)
     Dims const ropeCosShape = {3, {activeBatchSize, mNumWaypoints, mRopeHeadDim}};
     Dims const ropeIdxShape = {2, {activeBatchSize, mNumWaypoints}};
     Dims const kvShape = {4,
-        {activeBatchSize, static_cast<int64_t>(mConfig.numKVHeads), static_cast<int64_t>(mMaxSequenceLength),
+        {activeBatchSize, static_cast<int64_t>(mConfig.numKVHeads), static_cast<int64_t>(mKVCacheCapacity),
             mConfig.headDim}};
 
     bool status = true;
@@ -284,12 +284,16 @@ std::vector<std::vector<FutureTrajectoryPoint>> Alpamayo1ActionRunner::sampleTra
         LOG_ERROR("Invalid action KV batch view for batch size %d", activeBatchSize);
         return result;
     }
+    // The engine appends its mNumWaypoints action tokens at kvcache_start_index, inside the same capacity.
     int32_t const* const lengthsHost = batch.kvLengthsHost.dataPointer<int32_t>();
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
-        if (lengthsHost[b] <= 0 || lengthsHost[b] > mMaxSequenceLength)
+        if (lengthsHost[b] <= 0 || lengthsHost[b] > mKVCacheCapacity - mNumWaypoints)
         {
-            LOG_ERROR("Invalid action KV cache length for row %d: %d", b, lengthsHost[b]);
+            LOG_ERROR(
+                "Action KV cache length %d for row %d plus %d action tokens exceeds the action engine KV "
+                "capacity %d; re-export the action expert with a larger --max-kv-cache-capacity.",
+                lengthsHost[b], b, mNumWaypoints, mKVCacheCapacity);
             return result;
         }
     }
@@ -305,7 +309,7 @@ std::vector<std::vector<FutureTrajectoryPoint>> Alpamayo1ActionRunner::sampleTra
         kernel::gatherPagedKVToHeadMajor(kvcache.getCombinedKVCache(i).rawPointer(), kCacheBlock.rawPointer(),
             vCacheBlock.rawPointer(), batch.pageTable.kernelView().dataPointer<int32_t>(),
             batch.kvLengthsDevice.dataPointer<int32_t>(), batch.pageTable.maxPagesPerSeq(), activeBatchSize,
-            mMaxSequenceLength, mConfig.numKVHeads, mConfig.headDim, elemSize, stream);
+            mKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, elemSize, stream);
     }
 
     // Compute position IDs with rope delta offset
@@ -622,10 +626,16 @@ void Alpamayo1ActionRunner::allocateTensors(KVCacheManager::Config const& kvCach
     int32_t const maxBatch = std::min(static_cast<int32_t>(maxNoise.d[0]), kvCacheConfig.maxBatchSize);
     mMaxActionBatchSize = maxBatch;
 
-    mMaxSequenceLength = static_cast<int32_t>(kvCacheConfig.maxSequenceLength);
-
     nvinfer1::Dims noiseShape = mContext->getTensorShape(binding_names::kNoiseTrajectory);
     mNumWaypoints = noiseShape.d[1];
+
+    Dims const maxKCache
+        = mEngine->getProfileShape(binding_names::formatKCacheName(0, true).c_str(), 0, OptProfileSelector::kMAX);
+    mKVCacheCapacity = static_cast<int32_t>(maxKCache.d[2]);
+    ELLM_CHECK(mKVCacheCapacity == mConfig.maxKVCacheCapacity && mKVCacheCapacity > mNumWaypoints,
+        format::fmtstr("Action engine KV capacity %d must equal builder_config.max_kv_cache_capacity %d and exceed "
+                       "the %d action tokens.",
+            mKVCacheCapacity, mConfig.maxKVCacheCapacity, mNumWaypoints));
     rt::Coords noiseCoords({maxBatch, mNumWaypoints, 2});
 
     mNoiseTrajectoryDevice = rt::Tensor(
@@ -677,8 +687,7 @@ void Alpamayo1ActionRunner::allocateTensors(KVCacheManager::Config const& kvCach
     mRopePositionIdsDevice = rt::Tensor({maxBatch, 3, mNumWaypoints}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
         "Alpamayo1ActionRunner::mRopePositionIdsDevice");
 
-    rt::Coords const kvcacheShape{
-        kvCacheConfig.maxBatchSize, mConfig.numKVHeads, kvCacheConfig.maxSequenceLength, mConfig.headDim};
+    rt::Coords const kvcacheShape{maxBatch, mConfig.numKVHeads, mKVCacheCapacity, mConfig.headDim};
     mKCacheLayers.resize(static_cast<size_t>(mConfig.numDecoderLayers));
     mVCacheLayers.resize(static_cast<size_t>(mConfig.numDecoderLayers));
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)

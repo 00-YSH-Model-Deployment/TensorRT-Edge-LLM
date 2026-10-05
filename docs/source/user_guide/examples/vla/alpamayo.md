@@ -45,7 +45,7 @@ tensorrt-edgellm-export \
 
 This creates `onnx/llm`, `onnx/visual`, and `onnx/action`.
 
-> **Note:** Only FP16 is supported for Alpamayo export. The `--max-kv-cache-capacity` value must match the `--maxKVCacheCapacity` used when building the LLM engine in Step 3.
+> **Note:** Only FP16 is supported for Alpamayo export. `--max-kv-cache-capacity` sets the action expert's KV capacity. It can be smaller than the `--maxKVCacheCapacity` used for the LLM engine in Step 3 (and no larger than that value rounded up to a multiple of 128), as long as the longest prompt plus generated tokens plus the 64 action tokens fits; a request that does not fit fails in the action stage. A smaller capacity shortens the expert's attention. To change it, re-export only the expert with `--components action` and rebuild `action_build`.
 
 ## Step 2: Transfer to Device
 

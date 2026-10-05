@@ -501,3 +501,82 @@ TEST(GatherPagedKVToHeadMajorTest, OneByteKvPreservesFp8StorageLayout)
                 ASSERT_EQ(vOut[dst], poolHost[src + static_cast<size_t>(numPages) * pageElems]);
             }
 }
+
+// The Alpamayo action expert gathers into buffers sized by its own KV capacity, which may span fewer pages
+// than the LLM page-table row: rows must still be indexed with the row's stride and nothing past S written.
+TEST(GatherPagedKVToHeadMajorTest, DestinationShorterThanPageTableRow)
+{
+    cudaStream_t stream{nullptr};
+    constexpr int32_t B{2};
+    constexpr int32_t H{2};
+    constexpr int32_t D{4};
+    constexpr int32_t maxPagesPerSeq{3};
+    constexpr int32_t numPages{8};
+    int32_t const S = rt::kTOKENS_PER_PAGE + 5;
+    std::vector<int32_t> const lengths{rt::kTOKENS_PER_PAGE + 2, 10};
+
+    size_t const pageElems = static_cast<size_t>(rt::kTOKENS_PER_PAGE) * H * D;
+    std::vector<half> poolHost(static_cast<size_t>(2) * numPages * pageElems);
+    for (size_t i = 0; i < poolHost.size(); ++i)
+    {
+        poolHost[i] = __float2half(static_cast<float>(i % 2003) / 4.0F);
+    }
+    rt::Tensor pool({static_cast<int64_t>(poolHost.size())}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(pool, poolHost);
+    rt::KVPageTable pageTable(B, maxPagesPerSeq, numPages);
+    std::vector<std::vector<int32_t>> const rows{{6, 2, 4}, {1, 5, 7}};
+    for (int32_t slot = 0; slot < B; ++slot)
+    {
+        pageTable.setRow(slot, rows[slot].data(), static_cast<int32_t>(rows[slot].size()));
+    }
+    pageTable.upload(stream);
+    rt::Tensor kvSeqLens = makeKvSeqLens(lengths);
+
+    size_t const outputElements = static_cast<size_t>(B) * H * S * D;
+    size_t const guardElements = static_cast<size_t>(H) * S * D;
+    rt::Tensor kDst({static_cast<int64_t>(outputElements + guardElements)}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vDst({static_cast<int64_t>(outputElements + guardElements)}, rt::DeviceType::kGPU, DataType::kHALF);
+    std::vector<half> const canary(outputElements + guardElements, __float2half(-7.0F));
+    copyHostToDevice(kDst, canary);
+    copyHostToDevice(vDst, canary);
+
+    kernel::gatherPagedKVToHeadMajor(pool.rawPointer(), kDst.rawPointer(), vDst.rawPointer(),
+        pageTable.kernelView().dataPointer<int32_t>(), kvSeqLens.dataPointer<int32_t>(), maxPagesPerSeq, B, S, H, D,
+        sizeof(half), stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const kOut = copyDeviceToHost<half>(kDst);
+    auto const vOut = copyDeviceToHost<half>(vDst);
+    for (int32_t slot = 0; slot < B; ++slot)
+    {
+        for (int32_t head = 0; head < H; ++head)
+        {
+            for (int32_t token = 0; token < S; ++token)
+            {
+                for (int32_t dim = 0; dim < D; ++dim)
+                {
+                    size_t const dst = (static_cast<size_t>(slot) * H + head) * S * D + token * D + dim;
+                    half expectedK = __float2half(0.0F);
+                    half expectedV = __float2half(0.0F);
+                    if (token < lengths[slot])
+                    {
+                        int32_t const kPage = rows[slot][token / rt::kTOKENS_PER_PAGE];
+                        size_t const src = static_cast<size_t>(kPage) * pageElems
+                            + static_cast<size_t>(token % rt::kTOKENS_PER_PAGE) * H * D + head * D + dim;
+                        expectedK = poolHost[src];
+                        expectedV = poolHost[src + static_cast<size_t>(numPages) * pageElems];
+                    }
+                    ASSERT_EQ(__half_as_ushort(kOut[dst]), __half_as_ushort(expectedK))
+                        << "K mismatch at slot/head/token/dim " << slot << "/" << head << "/" << token << "/" << dim;
+                    ASSERT_EQ(__half_as_ushort(vOut[dst]), __half_as_ushort(expectedV))
+                        << "V mismatch at slot/head/token/dim " << slot << "/" << head << "/" << token << "/" << dim;
+                }
+            }
+        }
+    }
+    for (size_t i = outputElements; i < outputElements + guardElements; ++i)
+    {
+        ASSERT_EQ(__half_as_ushort(kOut[i]), __half_as_ushort(canary[i])) << "K written past S at " << i;
+        ASSERT_EQ(__half_as_ushort(vOut[i]), __half_as_ushort(canary[i])) << "V written past S at " << i;
+    }
+}

@@ -182,9 +182,12 @@ bool ActionBuilder::setupActionOptimizationProfile(
             maxKVCacheCapacity = input->getDimensions().d[2];
         }
     }
-    if (maxKVCacheCapacity == 0)
+    if (maxKVCacheCapacity <= 0)
     {
-        LOG_ERROR("Cannot infer maxKVCacheCapacity. Do you have proper k_cache and v_cache inputs in ONNX?");
+        LOG_ERROR(
+            "Cannot infer maxKVCacheCapacity from a static k_cache sequence dimension (got %d). Do you have proper "
+            "k_cache and v_cache inputs in ONNX?",
+            maxKVCacheCapacity);
         return false;
     }
 
