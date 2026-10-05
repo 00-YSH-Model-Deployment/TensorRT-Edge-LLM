@@ -37,7 +37,8 @@ Engine bindings (cached path):
 """
 
 import itertools
-from typing import List, Tuple
+import math
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,9 @@ _BATCH_SIZE = 2
 _BLOCK_SIZE = 16  # DFlash block size
 _CTX_LEN = 2  # Delta length for dummy shapes
 _KV_CAPACITY = 64  # Dummy KV cache capacity
+
+# Smallest normal FP16 is 2**-14; the fc input scale must stay an exact normal.
+_MAX_FC_INPUT_SCALE_LOG2 = 14
 
 # ---------------------------------------------------------------------------
 # MLP (SwiGLU, same as Qwen3)
@@ -408,6 +412,7 @@ class DFlashDraftModel(nn.Module):
                 "DFlash draft fc projector must remain dense FP16 for the "
                 "full-FP32 target-hidden projection. Exclude module 'fc' "
                 "from draft quantization.")
+        self.fc_fp16_input_scale_log2: Optional[int] = None
         norm_cls = (Gemma4RMSNorm
                     if _is_gemma4_model_type(config.model_type) else RMSNorm)
         self.hidden_norm = norm_cls(hidden_size, config.rms_norm_eps)
@@ -422,6 +427,39 @@ class DFlashDraftModel(nn.Module):
                                    config.vocab_size,
                                    bias=False,
                                    module_name="lm_head")
+
+    def enable_fp16_fc(self, scale_log2: Optional[int] = None) -> int:
+        """Run ``fc`` in FP16 on its input scaled by ``2**-scale_log2``.
+
+        The FP16 output is cast to FP32 and multiplied by ``2**scale_log2``,
+        both exact, so ``hidden_norm`` sees the FP32 projection up to the FP16
+        rounding of the scaled fc output. The default exponent is the smallest
+        for which ``65504 * max_j ||fc.weight[j]||_1 * 2**-k`` stays below the
+        FP16 maximum (with a margin for FP32 accumulation), so no finite FP16
+        input can overflow the output. The scale goes on the activations, not
+        into ``fc.weight`` (at that exponent most weights would become FP16
+        subnormals) nor into the ``hidden_norm`` epsilon (the ONNX exporter
+        drops an Add of a constant below 1e-8). Call after loading weights.
+
+        Returns the exponent used.
+        """
+        if self.fc_native_precision or not isinstance(self.fc, FP16Linear):
+            raise ValueError(
+                "enable_fp16_fc needs the dense FP16 fc projector.")
+        if self.fc.bias is not None:
+            raise ValueError("enable_fp16_fc does not support an fc bias.")
+        if self.fc_fp16_input_scale_log2 is not None:
+            raise RuntimeError("enable_fp16_fc was already applied.")
+        if scale_log2 is None:
+            row_l1 = self.fc.weight.detach().double().abs().sum(dim=1)
+            bound = row_l1.max().item() * (1.0 + 2.0**-6)
+            scale_log2 = max(0, math.ceil(math.log2(bound)))
+        if not 0 <= scale_log2 <= _MAX_FC_INPUT_SCALE_LOG2:
+            raise ValueError(
+                f"fc input scale exponent {scale_log2} is outside "
+                f"[0, {_MAX_FC_INPUT_SCALE_LOG2}].")
+        self.fc_fp16_input_scale_log2 = scale_log2
+        return scale_log2
 
     def forward(
         self,
@@ -447,6 +485,14 @@ class DFlashDraftModel(nn.Module):
         # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H].
         if self.fc_native_precision:
             h_delta_acc = self.fc(target_hidden_concat.to(torch.float16))
+        elif self.fc_fp16_input_scale_log2 is not None:
+            scale_log2 = self.fc_fp16_input_scale_log2
+            fc_input = target_hidden_concat.to(torch.float16)
+            if scale_log2:
+                fc_input = fc_input * 2.0**-scale_log2
+            h_delta_acc = self.fc(fc_input).to(torch.float32)
+            if scale_log2:
+                h_delta_acc = h_delta_acc * 2.0**scale_log2
         else:
             # Qwen3-8B target_hidden can spike above abs=2e4; the visible
             # pre-RMSNorm FC result must remain FP32 (an already-overflowed FP16

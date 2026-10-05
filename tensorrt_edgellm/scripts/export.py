@@ -1402,8 +1402,15 @@ def _export_gemma4_mtp_draft(target_dir: str, draft_out_dir: str,
 def _export_dflash_draft(model_dir: str,
                          draft_out_dir: str,
                          dflash_draft_dir: str,
-                         draft_reduced_vocab_dir: str = "") -> None:
-    """Export the DFlash draft model, optionally with reduced vocabulary."""
+                         draft_reduced_vocab_dir: str = "",
+                         fc_fp16: bool = False,
+                         fc_scale_log2: "int | None" = None) -> None:
+    """Export the DFlash draft model, optionally with reduced vocabulary.
+
+    ``fc_fp16`` runs the target-hidden projector in FP16 on a power-of-two
+    scaled input (see ``DFlashDraftModel.enable_fp16_fc``); ``fc_scale_log2``
+    overrides the overflow-proof default exponent.
+    """
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
@@ -1417,6 +1424,16 @@ def _export_dflash_draft(model_dir: str,
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         logger.exception("[DFlash Draft] Failed to load checkpoint")
         raise SystemExit(1) from exc
+
+    if fc_fp16:
+        try:
+            scale_log2 = model.enable_fp16_fc(fc_scale_log2)
+        except ValueError as exc:
+            logger.exception("[DFlash Draft] Cannot run fc in FP16")
+            raise SystemExit(1) from exc
+        logger.info(
+            "[DFlash Draft] fc runs in FP16 on its input scaled by 2^-%d",
+            scale_log2)
 
     # --- Optional: reduce draft lm_head vocabulary ---
     full_size = model.config.vocab_size
@@ -3998,6 +4015,24 @@ def main() -> None:
         help="Path to the DFlash draft checkpoint directory.",
     )
     p.add_argument(
+        "--dflash-fc-fp16",
+        action="store_true",
+        help=("Run the DFlash draft's target-hidden projector (fc) in FP16 "
+              "instead of FP32. Its input is scaled by 2^-K and its output, "
+              "cast to FP32, by 2^K, so the draft differs from the FP32 "
+              "projection only by FP16 rounding of the fc output. Halves the "
+              "fc weight the engine reads per draft step."),
+    )
+    p.add_argument(
+        "--dflash-fc-scale-log2",
+        type=int,
+        default=None,
+        metavar="K",
+        help=("With --dflash-fc-fp16: scale the fc input by 2^-K. Default: "
+              "the smallest K for which no finite FP16 input can overflow "
+              "the FP16 fc output."),
+    )
+    p.add_argument(
         "--jetspec-base",
         action="store_true",
         help="Export as JetSpec base model (adds target hidden-state output).",
@@ -4247,6 +4282,10 @@ def main() -> None:
                 "EAGLE/MTP/JetSpec/DSpark modes")
     if args.dflash_draft and not args.dflash_draft_dir:
         p.error("--dflash-draft requires --dflash-draft-dir")
+    if args.dflash_fc_fp16 and not args.dflash_draft:
+        p.error("--dflash-fc-fp16 requires --dflash-draft")
+    if args.dflash_fc_scale_log2 is not None and not args.dflash_fc_fp16:
+        p.error("--dflash-fc-scale-log2 requires --dflash-fc-fp16")
     if args.jetspec_base and (args.eagle_base or args.mtp or args.dflash_base
                               or args.dflash_draft or args.dspark_base
                               or args.dspark_draft):
@@ -4525,7 +4564,9 @@ def main() -> None:
             model_dir,
             out,
             args.dflash_draft_dir,
-            draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
+            draft_reduced_vocab_dir=args.draft_reduced_vocab_dir,
+            fc_fp16=args.dflash_fc_fp16,
+            fc_scale_log2=args.dflash_fc_scale_log2)),
         (args.jetspec_draft, "jetspec_draft",
          lambda out: _export_jetspec_draft(model_dir,
                                            out,

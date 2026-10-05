@@ -1549,6 +1549,11 @@ def make_dflash_draft_config(
     # Parse quantization config from the draft checkpoint directory.
     # For FP16 draft checkpoints this returns QuantConfig() (no quant).
     quant = _parse_quant(draft_dir, llm_dict)
+    # ``_parse_quant`` maps every FP4 algo to W4A4 NVFP4, whose linears need
+    # activation scales a weight-only ``W4A16_NVFP4`` draft does not carry.
+    if (quant.quant_type == QUANT_NVFP4
+            and "W4A16" in _hf_quant_algo(draft_dir)):
+        quant.quant_type = QUANT_NVFP4_A16
     # The fc feature projector must stay dense FP16 (the draft model asserts
     # this). Finalized NVFP4 drafts ship a packed fc; excluding it here keeps
     # ``make_linear`` producing FP16Linear, and the loader dequantizes the
@@ -2270,6 +2275,16 @@ def _scope_exclusions(patterns: List[str], submodel_prefix: str) -> List[str]:
         elif pat.startswith("*") or pat == "":
             scoped.append(pat)
     return scoped
+
+
+def _hf_quant_algo(model_dir: str) -> str:
+    """Upper-case ``quant_algo`` of ``hf_quant_config.json``, '' if absent."""
+    hf_path = os.path.join(model_dir, "hf_quant_config.json")
+    if not os.path.exists(hf_path):
+        return ""
+    with open(hf_path) as f:
+        q = json.load(f).get("quantization", {})
+    return (q.get("quant_algo") or "").upper()
 
 
 def _parse_quant(model_dir: str,
