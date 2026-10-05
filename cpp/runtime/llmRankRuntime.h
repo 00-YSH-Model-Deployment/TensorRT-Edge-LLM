@@ -337,6 +337,35 @@ private:
     // [5] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices;     //!< GPU [batchSize, seqLen] multimodal embedding indices
     rt::Tensor mHostMultimodalIndices; //!< Host pinned [batchSize, seqLen] staging for CPU-computed indices
+    //! First image-embedding row of the tokens being prefilled, for a prefill that starts inside the prompt
+    //! without the context cache (streaming prefill). 0 otherwise.
+    int32_t mPrefillImageBase{0};
+
+    //! Streaming prefill (EDGELLM_STREAMING_PREFILL=1): consecutive batch-1 requests are windows of one clip whose
+    //! prompts have the same layout, each camera's frames shifted by one. The previous request's KV is kept; each
+    //! camera's frame blocks 1..N-1 move into slots 0..N-2 and only the newest frame block of every camera and the
+    //! text after the last frame are prefilled, each against everything before it (FlashDrive's streaming VLM).
+    struct StreamingPrefillState
+    {
+        bool enabled{false};
+        int32_t framesPerView{4};
+        bool valid{false};                                 //!< The slot-0 KV holds the prompt below
+        std::vector<int32_t> promptIds;                    //!< Prompt whose KV is resident
+        std::vector<std::pair<int32_t, int32_t>> frames;   //!< [start, end) of each frame's vision block
+        std::vector<Hash128> imageHashes;                  //!< Pixel hash of each resident frame
+    };
+    StreamingPrefillState mStreaming;
+    //! Pixel hash of each image of the request being served (empty without the encoder cache). Streaming prefill
+    //! reuses KV only when each camera's frames 0..N-2 are the resident frames 1..N-1, pixel for pixel; the layout
+    //! alone cannot tell a new clip from the next window of the same one.
+    std::vector<Hash128> mRequestImageHashes;
+
+    //! Vision blocks ([VS] image tokens [VE]) of a prompt, in prompt order.
+    std::vector<std::pair<int32_t, int32_t>> findFrameBlocks(std::vector<int32_t> const& ids) const;
+    //! Whether this request can reuse the resident KV under streaming prefill.
+    bool streamingPrefillApplies(DecodingInferenceContext const& context) const;
+    //! Shift the resident frame KV and prefill the new frame blocks and the trailing text in chunks.
+    bool runStreamingPrefill(DecodingInferenceContext& context);
 
     // [6] Logprobs support tensors. Non-Diffusion paths allocate at construction to preserve existing behavior.
     // DiffusionGemma allocates lazily when a request asks for numLogprobs because its row count is B * canvasLen.

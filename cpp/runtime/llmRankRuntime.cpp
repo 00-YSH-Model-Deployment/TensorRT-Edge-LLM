@@ -615,6 +615,17 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         }
     }
 
+    if (char const* streaming = std::getenv("EDGELLM_STREAMING_PREFILL"))
+    {
+        mStreaming.enabled = std::atoi(streaming) != 0 && !contextCacheConfig.enabled;
+        if (char const* perView = std::getenv("EDGELLM_STREAMING_FRAMES_PER_VIEW"))
+        {
+            mStreaming.framesPerView = std::max(2, std::atoi(perView));
+        }
+        LOG_INFO("Streaming prefill %s (%d frames per camera)", mStreaming.enabled ? "on" : "off",
+            mStreaming.framesPerView);
+    }
+
     if (contextCacheConfig.enabled)
     {
         ELLM_CHECK(mActionRunner == nullptr, "Context reuse cannot be enabled with action runners.");
@@ -1236,9 +1247,26 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         context.contextCacheReplayTailLength = request.contextCacheReplayTailLength;
         prefillStatus = runHybridMtpPrefill(context, decodingStrategy, *contextCacheRequest);
     }
+    else if (managedRequest == nullptr && streamingPrefillApplies(context))
+    {
+        prefillStatus = runStreamingPrefill(context);
+    }
     else
     {
         prefillStatus = runBaseModelPrefill(context, managedRequest);
+    }
+    if (mStreaming.enabled)
+    {
+        // The slot-0 KV now holds this prompt; decode writes only past its end.
+        bool const reusable = prefillStatus && managedRequest == nullptr && context.activeBatchSize == 1
+            && context.visualEmbeddings.has_value();
+        mStreaming.valid = reusable;
+        if (reusable)
+        {
+            mStreaming.promptIds = context.rawBatchedInputIds[0];
+            mStreaming.frames = findFrameBlocks(mStreaming.promptIds);
+            mStreaming.imageHashes = mRequestImageHashes;
+        }
     }
     if (!prefillStatus)
     {
@@ -2133,6 +2161,7 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(
             }
         }
 
+        mRequestImageHashes = imageHashes;
         if (!imageHashes.empty())
         {
             if (!encodeVisionWithCache(request, images, imageHashes, batchedInputIds, mropeCosSinOut, stream))
@@ -2609,7 +2638,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
         }
         else
         {
-            int32_t imageIndex = 0;
+            int32_t imageIndex = mPrefillImageBase;
             int32_t audioIndex = 0;
             for (int32_t i = 0; i < activeBatchSize; ++i)
             {
@@ -2904,6 +2933,140 @@ void LLMRankRuntime::zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream)
         CUDA_CHECK(cudaMemsetAsync(recurrentDst, 0, recurrentBatchBytes, stream));
         CUDA_CHECK(cudaMemsetAsync(convDst, 0, convBatchBytes, stream));
     }
+}
+
+std::vector<std::pair<int32_t, int32_t>> LLMRankRuntime::findFrameBlocks(std::vector<int32_t> const& ids) const
+{
+    // A frame is a run of image tokens; its block adds the [VS] before and the [VE] after.
+    std::vector<std::pair<int32_t, int32_t>> blocks;
+    int32_t const imageTokenId = mDeployment.base.imageTokenId;
+    int32_t const n = static_cast<int32_t>(ids.size());
+    for (int32_t p = 0; p < n; ++p)
+    {
+        if (ids[p] != imageTokenId)
+        {
+            continue;
+        }
+        int32_t end = p;
+        while (end < n && ids[end] == imageTokenId)
+        {
+            ++end;
+        }
+        blocks.emplace_back(std::max(p - 1, 0), std::min(end + 1, n));
+        p = end;
+    }
+    return blocks;
+}
+
+bool LLMRankRuntime::streamingPrefillApplies(DecodingInferenceContext const& context) const
+{
+    if (!mStreaming.enabled || !mStreaming.valid || context.activeBatchSize != 1 || !context.visualEmbeddings.has_value()
+        || mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] != 0)
+    {
+        return false;
+    }
+    auto const& ids = context.rawBatchedInputIds[0];
+    auto const& prev = mStreaming.promptIds;
+    auto const& frames = mStreaming.frames;
+    int32_t const n = mStreaming.framesPerView;
+    if (ids.size() != prev.size() || frames.empty() || frames.size() % n != 0 || findFrameBlocks(ids) != frames)
+    {
+        return false;
+    }
+    // Everything up to the last frame (system prompt, camera and frame labels) must be the resident prompt's; the
+    // image tokens are placeholders, so equality says the layout matches, not the pixels.
+    if (!std::equal(ids.begin(), ids.begin() + frames.back().second, prev.begin()))
+    {
+        return false;
+    }
+    auto const& now = mRequestImageHashes;
+    auto const& resident = mStreaming.imageHashes;
+    if (now.size() != frames.size() || resident.size() != frames.size())
+    {
+        return false;
+    }
+    for (size_t f = 0; f + 1 < frames.size(); ++f)
+    {
+        if ((f + 1) % n != 0 && !(now[f] == resident[f + 1]))
+        {
+            return false;
+        }
+    }
+    for (size_t f = 0; f + 1 < frames.size(); ++f)
+    {
+        bool const sameView = (f + 1) % n != 0;
+        if (sameView && frames[f].second - frames[f].first != frames[f + 1].second - frames[f + 1].first)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LLMRankRuntime::runStreamingPrefill(DecodingInferenceContext& context)
+{
+    auto const& ids = context.rawBatchedInputIds[0];
+    auto const& frames = mStreaming.frames;
+    int32_t const n = mStreaming.framesPerView;
+    int32_t const views = static_cast<int32_t>(frames.size()) / n;
+    auto& cacheMgr = *mSharedResources->cacheManagers[0];
+    auto& kvMgr = cacheMgr.getKVCacheManager();
+    auto const& kvConfig = kvMgr.getConfig();
+    size_t const elemSize = rt::utils::getTypeSize(kvConfig.kvCacheType);
+
+    // Batch 1 on the identity page table: slot 0's tokens are contiguous rows of each layer's K half and V half.
+    // Move each camera's frame k+1 block into frame k's slot for k = 0..n-2 in order, so a source is always read
+    // before it is overwritten. Keys keep the rotation of their old slot, as in FlashDrive's index_copy.
+    for (int32_t layer = 0; layer < kvConfig.numAttentionLayers; ++layer)
+    {
+        auto const& lc = kvConfig.layerConfigs[static_cast<size_t>(layer)];
+        size_t const rowBytes = static_cast<size_t>(lc.numKVHeads) * lc.headDim * elemSize;
+        size_t const halfBytes = static_cast<size_t>(kvMgr.numPages()) * kTOKENS_PER_PAGE * rowBytes;
+        char* const pool = static_cast<char*>(kvMgr.getCombinedKVCache(layer).rawPointer());
+        for (size_t half : {size_t{0}, halfBytes})
+        {
+            for (int32_t v = 0; v < views; ++v)
+            {
+                for (int32_t k = 0; k + 1 < n; ++k)
+                {
+                    auto const& dst = frames[static_cast<size_t>(v * n + k)];
+                    auto const& src = frames[static_cast<size_t>(v * n + k + 1)];
+                    CUDA_CHECK(cudaMemcpyAsync(pool + half + dst.first * rowBytes, pool + half + src.first * rowBytes,
+                        static_cast<size_t>(src.second - src.first) * rowBytes, cudaMemcpyDeviceToDevice,
+                        context.stream));
+                }
+            }
+        }
+    }
+
+    // Regions to prefill: each camera's newest frame block, then everything after the last frame. Each attends to
+    // the whole cache before it, which is exactly a prefill with that prefix already resident.
+    std::vector<std::pair<int32_t, int32_t>> regions;
+    for (int32_t v = 0; v < views; ++v)
+    {
+        regions.push_back(frames[static_cast<size_t>(v * n + n - 1)]);
+    }
+    regions.emplace_back(frames.back().second, static_cast<int32_t>(ids.size()));
+
+    int32_t const imageTokenId = mDeployment.base.imageTokenId;
+    int32_t* reuse = mHostReuseKVCacheLengths.dataPointer<int32_t>();
+    for (size_t r = 0; r < regions.size(); ++r)
+    {
+        auto const [start, end] = regions[r];
+        reuse[0] = start;
+        cacheMgr.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+        context.tokenIds[0].assign(ids.begin() + start, ids.begin() + end);
+        context.effectivePrefillLengths[0] = end - start;
+        mPrefillImageBase = static_cast<int32_t>(std::count(ids.begin(), ids.begin() + start, imageTokenId));
+        bool const ok = runBaseModelPrefill(context, nullptr, r + 1 == regions.size());
+        mPrefillImageBase = 0;
+        if (!ok)
+        {
+            return false;
+        }
+    }
+    reuse[0] = 0;
+    return true;
 }
 
 bool LLMRankRuntime::setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy,
