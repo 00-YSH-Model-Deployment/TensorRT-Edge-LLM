@@ -55,6 +55,10 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     callbackEmittedTokenCounts.clear();
     callbackEmittedTokenCounts.resize(batchSize, 0);
     shouldStopAfterAcceptedToken = {};
+    externalDraft = {};
+    externalDraftRounds = 0;
+    externalDraftProposed = 0;
+    externalDraftAccepted = 0;
 
     batchIndexMapping.resize(batchSize);
     for (int32_t i = 0; i < batchSize; ++i)

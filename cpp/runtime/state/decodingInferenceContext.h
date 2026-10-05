@@ -144,6 +144,13 @@ struct DecodingInferenceContext
     //! Optional callback used by speculative decoders to stop appending accepted tokens.
     std::function<bool(int32_t, int32_t)> shouldStopAfterAcceptedToken;
 
+    //! Optional host draft for block-draft decoders (DFlash, batch 1): writes up to `capacity` tokens continuing
+    //! tokenIds[slot] to `out` and returns the count; 0 leaves the step to the draft engine.
+    std::function<int32_t(int32_t slot, int32_t* out, int32_t capacity)> externalDraft;
+    int32_t externalDraftRounds{0};   //!< Verify rounds that used the external draft
+    int32_t externalDraftProposed{0}; //!< External tokens proposed in those rounds
+    int32_t externalDraftAccepted{0}; //!< External tokens the base model confirmed
+
     //! Few-layer-validation debug: per-request layer dumper (null unless the
     //! EDGELLM_DUMP_LOGITS_KVCACHE_* env vars are set). Owned here via RAII so it shares the
     //! context's lifetime exactly; see the out-of-line destructor. Also carries optional

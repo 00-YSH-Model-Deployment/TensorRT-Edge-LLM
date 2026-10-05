@@ -37,6 +37,7 @@
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/temporalDraft.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/contextCache/blockHash.h"
 #include "runtime/state/contextCache/contextCacheCoordinator.h"
@@ -615,15 +616,25 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         }
     }
 
+    if (char const* perView = std::getenv("EDGELLM_STREAMING_FRAMES_PER_VIEW"))
+    {
+        mStreaming.framesPerView = std::max(2, std::atoi(perView));
+    }
     if (char const* streaming = std::getenv("EDGELLM_STREAMING_PREFILL"))
     {
         mStreaming.enabled = std::atoi(streaming) != 0 && !contextCacheConfig.enabled;
-        if (char const* perView = std::getenv("EDGELLM_STREAMING_FRAMES_PER_VIEW"))
-        {
-            mStreaming.framesPerView = std::max(2, std::atoi(perView));
-        }
         LOG_INFO("Streaming prefill %s (%d frames per camera)", mStreaming.enabled ? "on" : "off",
             mStreaming.framesPerView);
+    }
+    if (char const* temporal = std::getenv("EDGELLM_TEMPORAL_DRAFT"))
+    {
+        mTemporalDraft.enabled = std::atoi(temporal) != 0;
+        if (char const* minMatch = std::getenv("EDGELLM_TEMPORAL_DRAFT_MIN_MATCH"))
+        {
+            mTemporalDraft.minMatch = std::max(1, std::atoi(minMatch));
+        }
+        LOG_INFO("Temporal draft %s (min match %d, %d frames per camera)", mTemporalDraft.enabled ? "on" : "off",
+            mTemporalDraft.minMatch, mStreaming.framesPerView);
     }
 
     if (contextCacheConfig.enabled)
@@ -1239,6 +1250,10 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
+    // Consecutive batch-1 requests are taken to be consecutive windows; a wrong guess only costs acceptance.
+    bool const temporalDraft = mTemporalDraft.enabled && managedRequest == nullptr && request.numLogprobs == 0
+        && decodingStrategy.kind() == DecodingStrategyKind::kDFlash && !mTemporalDraft.previousOutput.empty();
+
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
     bool prefillStatus;
     if (hybridMtpContextReuse)
@@ -1543,6 +1558,17 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
+    if (temporalDraft && context.activeBatchSize == 1)
+    {
+        context.externalDraft = [this, &context](int32_t slot, int32_t* out, int32_t capacity) {
+            auto const& ids = context.tokenIds[slot];
+            int32_t const generated = context.currentGenerateLengths[slot];
+            return temporal_draft::propose(mTemporalDraft.previousOutput.data(),
+                static_cast<int32_t>(mTemporalDraft.previousOutput.size()), ids.data() + (ids.size() - generated),
+                generated, mTemporalDraft.minMatch, out, capacity);
+        };
+    }
+
     while (!checkAllFinished())
     {
         // Observe any consumer cancels at the top of the iteration so they land
@@ -1586,6 +1612,13 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
             LOG_ERROR("Failed to perform batch eviction.");
             return false;
         }
+    }
+
+    if (context.externalDraft)
+    {
+        LOG_INFO("Temporal draft: %d of %d rounds verified the previous window's tokens, %d of %d proposed accepted",
+            context.externalDraftRounds, context.generationRound, context.externalDraftAccepted,
+            context.externalDraftProposed);
     }
 
     // Few-layer-validation debug: write the accumulated per-layer logits/KV dump for this request.
@@ -1697,6 +1730,15 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
                 // streaming-path matcher missed.
                 response.finishReasons[originalIdx] = FinishReason::kStopWords;
             }
+        }
+    }
+
+    if (mTemporalDraft.enabled)
+    {
+        mTemporalDraft.previousOutput.clear();
+        if (response.outputIds.size() == 1)
+        {
+            mTemporalDraft.previousOutput = response.outputIds[0];
         }
     }
 

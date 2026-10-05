@@ -55,6 +55,10 @@ namespace
 {
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
+//! An external proposal shorter than this is left to the draft engine, which proposes the whole block.
+constexpr int32_t kExternalDraftMinProposal{3};
+//! An external step that confirms fewer proposals than this cools the external draft down for one step.
+constexpr int32_t kExternalDraftMinConfirmed{2};
 
 int32_t dflashDraftProfileForRound(int32_t generationRound)
 {
@@ -187,6 +191,8 @@ DFlashDecoder::DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::p
     mHostDeltaLens = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlashDraft::hostDeltaLens");
     mLastAcceptedTokens
         = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlashDraft::lastAcceptedTokens");
+    mHostExternalDraft = Tensor(
+        {maxBatch, mBlockDraft.blockSize}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "DFlashDraft::hostExternal");
 
     mTreeTokenIds = Tensor(
         {maxBatch, mBlockDraft.verifySize}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "DFlash::treeTokenIds");
@@ -255,17 +261,28 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
     NVTX_SCOPED_RANGE(nvtx_dflash_decode, "DFlashDecoder::decodeStep", nvtx_colors::GREEN);
     cudaGetLastError();
 
+    int32_t external = 0;
     {
         TIME_STAGE(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, context.stream);
         bool const usePendingPrefillProposal
             = mCommonStateTracker.shouldUsePendingPrefillProposal(context.generationRound);
-        if (!usePendingPrefillProposal && !runDraftForward(context))
+        if (!usePendingPrefillProposal)
+        {
+            external = stageExternalDraft(context);
+        }
+        if (external > 0)
+        {
+            // The draft engine is skipped, but its context window must still take this round's target rows:
+            // the next verify overwrites baseHiddenStates.
+            stageDraftTargets(context);
+        }
+        else if (!usePendingPrefillProposal && !runDraftForward(context))
         {
             LOG_ERROR("DFlashDecoder: draft forward failed.");
             return false;
         }
         mCommonStateTracker.materializePending(context.generationRound, context.activeBatchSize);
-        if (!prepareBlockDraftVerifyInputs(context))
+        if (!prepareBlockDraftVerifyInputs(context, external > 0))
         {
             LOG_ERROR("DFlashDecoder: verify input preparation failed.");
             return false;
@@ -279,6 +296,16 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
         return false;
     }
     mCommonStateTracker.recordAccepted(mHostAcceptLengths.dataPointer<int32_t>(), context.activeBatchSize);
+    if (external > 0)
+    {
+        // The accept length counts the base model's own token after the last confirmed proposal.
+        int32_t const confirmed = std::min(external, std::max(0, mHostAcceptLengths.dataPointer<int32_t>()[0] - 1));
+        context.externalDraftRounds += 1;
+        context.externalDraftProposed += external;
+        context.externalDraftAccepted += confirmed;
+        // A diverged window: let the draft engine take the next step; the lookup re-aligns after it.
+        mExternalDraftCooldown = confirmed < kExternalDraftMinConfirmed ? 1 : 0;
+    }
 
     return true;
 }
@@ -319,76 +346,14 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     int32_t const activeBatchSize = context.activeBatchSize;
     int32_t const BS = mBlockDraft.blockSize;
 
-    // Step 1: Prepare draft input token IDs: [last_accepted_token, mask_id, ..., mask_id].
-    check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, BS}), "Tensor reshape failed");
-    check::check(mHostDraftInputIds.reshape({activeBatchSize, BS}), "Tensor reshape failed");
-    check::check(mHostLastAcceptedTokens.reshape({activeBatchSize}), "Tensor reshape failed");
-    check::check(mLastAcceptedTokens.reshape({activeBatchSize}), "Tensor reshape failed");
-    int32_t* hostDraftInputIds = mHostDraftInputIds.dataPointer<int32_t>();
-    int32_t* hostLastAccepted = mHostLastAcceptedTokens.dataPointer<int32_t>();
-    for (int32_t b = 0; b < activeBatchSize; ++b)
-    {
-        hostLastAccepted[b] = context.tokenIds[b].back();
-        hostDraftInputIds[b * BS] = hostLastAccepted[b];
-        for (int32_t j = 1; j < BS; ++j)
-        {
-            hostDraftInputIds[b * BS + j] = mBlockDraft.maskTokenId;
-        }
-    }
-    CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), mHostDraftInputIds.rawPointer(),
-        activeBatchSize * BS * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
-    CUDA_CHECK(cudaMemcpyAsync(mLastAcceptedTokens.rawPointer(), mHostLastAcceptedTokens.rawPointer(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    // Steps 1 and 3: draft input ids, verify root, target-hidden delta.
+    int64_t const maxDeltaLen = stageDraftTargets(context);
 
     // Step 2: Embed the draft inputs.
     check::check(
         mDraftInputsEmbeds.reshape({activeBatchSize, BS, mBlockDraft.draftHiddenSize}), "Tensor reshape failed");
     kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
         mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
-
-    // Step 3: Prepare target-hidden delta from base hidden states.
-    // Round 0 uses prefill hidden states; later rounds use accepted base hidden states.
-    // The draft KV update plugin consumes per-batch delta_lengths to skip padded rows.
-    int64_t maxDeltaLen;
-    int64_t sourceSeqLen;
-    check::check(mHostDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
-    int32_t* hostDeltaLens = mHostDeltaLens.dataPointer<int32_t>();
-    if (context.generationRound == 0)
-    {
-        sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
-        maxDeltaLen = 0;
-        for (int32_t b = 0; b < activeBatchSize; ++b)
-        {
-            int32_t const prefillLen = context.effectivePrefillLengths[b];
-            hostDeltaLens[b] = prefillLen;
-            maxDeltaLen = std::max(maxDeltaLen, static_cast<int64_t>(prefillLen));
-        }
-    }
-    else
-    {
-        sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
-        int32_t const* hostAccLens = mHostAcceptLengths.dataPointer<int32_t>();
-        maxDeltaLen = 0;
-        for (int32_t b = 0; b < activeBatchSize; ++b)
-        {
-            hostDeltaLens[b] = hostAccLens[b];
-            maxDeltaLen = std::max(maxDeltaLen, static_cast<int64_t>(hostAccLens[b]));
-        }
-    }
-
-    if (mContextWindow > 0)
-    {
-        maxDeltaLen = slideDraftContextWindow(activeBatchSize, sourceSeqLen, context.generationRound == 0, context.stream);
-    }
-
-    check::check(mDraftDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
-
-    if (mContextWindow == 0)
-    {
-        bindTargetHiddenDelta(activeBatchSize, maxDeltaLen, sourceSeqLen, context.generationRound == 0, context.stream);
-    }
 
     // Step 4: Prepare proposal attention inputs.
     int32_t const pmLen = divUp(BS, 32);
@@ -448,7 +413,109 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     return true;
 }
 
-bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& context)
+int64_t DFlashDecoder::stageDraftTargets(DecodingInferenceContext& context)
+{
+    int32_t const activeBatchSize = context.activeBatchSize;
+    int32_t const BS = mBlockDraft.blockSize;
+
+    // Step 1: Prepare draft input token IDs: [last_accepted_token, mask_id, ..., mask_id].
+    check::check(mRuntime.preprocess.idsInput.reshape({activeBatchSize, BS}), "Tensor reshape failed");
+    check::check(mHostDraftInputIds.reshape({activeBatchSize, BS}), "Tensor reshape failed");
+    check::check(mHostLastAcceptedTokens.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mLastAcceptedTokens.reshape({activeBatchSize}), "Tensor reshape failed");
+    int32_t* hostDraftInputIds = mHostDraftInputIds.dataPointer<int32_t>();
+    int32_t* hostLastAccepted = mHostLastAcceptedTokens.dataPointer<int32_t>();
+    for (int32_t b = 0; b < activeBatchSize; ++b)
+    {
+        hostLastAccepted[b] = context.tokenIds[b].back();
+        hostDraftInputIds[b * BS] = hostLastAccepted[b];
+        for (int32_t j = 1; j < BS; ++j)
+        {
+            hostDraftInputIds[b * BS + j] = mBlockDraft.maskTokenId;
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), mHostDraftInputIds.rawPointer(),
+        activeBatchSize * BS * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    CUDA_CHECK(cudaMemcpyAsync(mLastAcceptedTokens.rawPointer(), mHostLastAcceptedTokens.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+
+    // Step 3: Prepare target-hidden delta from base hidden states.
+    // Round 0 uses prefill hidden states; later rounds use accepted base hidden states.
+    // The draft KV update plugin consumes per-batch delta_lengths to skip padded rows.
+    int64_t maxDeltaLen;
+    int64_t sourceSeqLen;
+    check::check(mHostDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
+    int32_t* hostDeltaLens = mHostDeltaLens.dataPointer<int32_t>();
+    if (context.generationRound == 0)
+    {
+        sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
+        maxDeltaLen = 0;
+        for (int32_t b = 0; b < activeBatchSize; ++b)
+        {
+            int32_t const prefillLen = context.effectivePrefillLengths[b];
+            hostDeltaLens[b] = prefillLen;
+            maxDeltaLen = std::max(maxDeltaLen, static_cast<int64_t>(prefillLen));
+        }
+    }
+    else
+    {
+        sourceSeqLen = mRuntime.base.pipelineIO.baseHiddenStates.getShape()[1];
+        int32_t const* hostAccLens = mHostAcceptLengths.dataPointer<int32_t>();
+        maxDeltaLen = 0;
+        for (int32_t b = 0; b < activeBatchSize; ++b)
+        {
+            hostDeltaLens[b] = hostAccLens[b];
+            maxDeltaLen = std::max(maxDeltaLen, static_cast<int64_t>(hostAccLens[b]));
+        }
+    }
+
+    if (mContextWindow > 0)
+    {
+        maxDeltaLen = slideDraftContextWindow(activeBatchSize, sourceSeqLen, context.generationRound == 0, context.stream);
+    }
+
+    check::check(mDraftDeltaLens.reshape({activeBatchSize}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(mDraftDeltaLens.rawPointer(), mHostDeltaLens.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+
+    if (mContextWindow == 0)
+    {
+        bindTargetHiddenDelta(activeBatchSize, maxDeltaLen, sourceSeqLen, context.generationRound == 0, context.stream);
+    }
+    return maxDeltaLen;
+}
+
+int32_t DFlashDecoder::stageExternalDraft(DecodingInferenceContext& context)
+{
+    // Window mode only: the draft cache restarts every round there, so skipping the draft engine for a step
+    // leaves nothing stale. With the whole-context cache, a skipped step would leave a gap in the draft KV.
+    if (!context.externalDraft || context.activeBatchSize != 1 || useDDTree() || mContextWindow == 0)
+    {
+        return 0;
+    }
+    if (mExternalDraftCooldown > 0)
+    {
+        --mExternalDraftCooldown;
+        return 0;
+    }
+    int32_t const BS = mBlockDraft.blockSize;
+    check::check(mHostExternalDraft.reshape({1, BS}), "Tensor reshape failed");
+    int32_t* host = mHostExternalDraft.dataPointer<int32_t>();
+    int32_t const proposed = std::min(context.externalDraft(0, host + 1, mBlockDraft.proposalLen), mBlockDraft.proposalLen);
+    if (proposed < kExternalDraftMinProposal)
+    {
+        return 0;
+    }
+    // Slot 0 is replaced by the verify root; mask ids past the proposal are never the base model's argmax.
+    host[0] = mBlockDraft.maskTokenId;
+    std::fill(host + 1 + proposed, host + BS, mBlockDraft.maskTokenId);
+    check::check(mDraftTokenIds.reshape({1, BS}), "Tensor reshape failed");
+    CUDA_CHECK(cudaMemcpyAsync(
+        mDraftTokenIds.rawPointer(), host, BS * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    return proposed;
+}
+
+bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& context, bool externalDraft)
 {
     NVTX_SCOPED_RANGE(
         nvtx_dflash_prepare_verify, "DFlashDecoder::prepareBlockDraftVerifyInputs", nvtx_colors::LIGHT_ORANGE);
@@ -462,14 +529,21 @@ bool DFlashDecoder::prepareBlockDraftVerifyInputs(DecodingInferenceContext& cont
     {
         // Linear DFlash uses candidateTopK == 1: select one draft token per block
         // position, then build a causal verify tree in the shared verify buffers.
-        check::check(mDraftOutputLogits.reshape({activeBatchSize * mBlockDraft.blockSize, mBlockDraft.draftVocabSize}),
-            "Tensor reshape failed");
-        check::check(mDraftTokenIds.reshape({activeBatchSize * mBlockDraft.blockSize, 1}), "Tensor reshape failed");
-        selectAllTopK(mDraftOutputLogits, std::nullopt, mDraftTokenIds, 1, mRuntime.sampling.workspace, context.stream);
+        // An external draft is already in mDraftTokenIds, in full-vocab ids.
+        if (!externalDraft)
+        {
+            check::check(
+                mDraftOutputLogits.reshape({activeBatchSize * mBlockDraft.blockSize, mBlockDraft.draftVocabSize}),
+                "Tensor reshape failed");
+            check::check(
+                mDraftTokenIds.reshape({activeBatchSize * mBlockDraft.blockSize, 1}), "Tensor reshape failed");
+            selectAllTopK(
+                mDraftOutputLogits, std::nullopt, mDraftTokenIds, 1, mRuntime.sampling.workspace, context.stream);
+        }
         check::check(mDraftTokenIds.reshape({activeBatchSize, mBlockDraft.blockSize}), "Tensor reshape failed");
 
         // Remap reduced-vocab draft IDs to full-vocab IDs before base verify.
-        if (mHasDraftVocabMap)
+        if (mHasDraftVocabMap && !externalDraft)
         {
             check::check(mDraftTokenIds.reshape({activeBatchSize * mBlockDraft.blockSize}), "Tensor reshape failed");
             mapReducedVocabToFullVocab(mDraftTokenIds, mDraftVocabMappingTable, context.stream);
@@ -1220,6 +1294,7 @@ void DFlashDecoder::resetForNewSequences(Tensor& reuseLengths, cudaStream_t stre
 {
     mDraftCacheManager.resetForNewSequences(reuseLengths, stream);
     mCommonStateTracker.reset();
+    mExternalDraftCooldown = 0;
 }
 
 void DFlashDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,

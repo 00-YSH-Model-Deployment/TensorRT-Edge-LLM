@@ -360,6 +360,18 @@ private:
     //! alone cannot tell a new clip from the next window of the same one.
     std::vector<Hash128> mRequestImageHashes;
 
+    //! Temporal draft (EDGELLM_TEMPORAL_DRAFT=1, DFlash, batch 1): consecutive requests are consecutive camera
+    //! windows, so the previous request's generated tokens are proposed for verification in place of the draft
+    //! engine's block wherever they continue the current output (temporalDraft.h). Verification is unchanged, so
+    //! the output is the base model's.
+    struct TemporalDraftState
+    {
+        bool enabled{false};
+        int32_t minMatch{2};                 //!< Shortest suffix match that may propose
+        std::vector<int32_t> previousOutput; //!< Generated tokens of the previous request
+    };
+    TemporalDraftState mTemporalDraft;
+
     //! Vision blocks ([VS] image tokens [VE]) of a prompt, in prompt order.
     std::vector<std::pair<int32_t, int32_t>> findFrameBlocks(std::vector<int32_t> const& ids) const;
     //! Whether this request can reuse the resident KV under streaming prefill.

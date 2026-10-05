@@ -80,7 +80,13 @@ public:
 
 private:
     bool runDraftForward(DecodingInferenceContext& context);
-    bool prepareBlockDraftVerifyInputs(DecodingInferenceContext& context);
+    //! Draft-forward steps that do not involve the draft engine: the verify root and the target-hidden rows this
+    //! round adds to the draft context. Returns the target-hidden length the draft engine would bind.
+    int64_t stageDraftTargets(DecodingInferenceContext& context);
+    //! Asks context.externalDraft for this step's proposal and uploads it to mDraftTokenIds; returns the number
+    //! of proposed tokens, 0 to leave the step to the draft engine.
+    int32_t stageExternalDraft(DecodingInferenceContext& context);
+    bool prepareBlockDraftVerifyInputs(DecodingInferenceContext& context, bool externalDraft = false);
     bool captureDraftCudaGraphs(cudaStream_t stream);
     bool buildTreeVerifyInputs(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
@@ -143,6 +149,10 @@ private:
     Tensor mHostLastAcceptedTokens; //!< [B] INT32 CPU
     Tensor mHostDeltaLens;          //!< [B] INT32 CPU
     Tensor mLastAcceptedTokens;     //!< [B] INT32 GPU
+
+    //! External draft (context.externalDraft): host staging [B, blockSize] for proposals; slot 0 is the root.
+    Tensor mHostExternalDraft;
+    int32_t mExternalDraftCooldown{0}; //!< Draft-engine steps to take before trying the external draft again
 
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 
