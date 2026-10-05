@@ -55,10 +55,6 @@ namespace
 {
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
-//! An external proposal shorter than this is left to the draft engine, which proposes the whole block.
-constexpr int32_t kExternalDraftMinProposal{3};
-//! An external step that confirms fewer proposals than this cools the external draft down for one step.
-constexpr int32_t kExternalDraftMinConfirmed{2};
 
 int32_t dflashDraftProfileForRound(int32_t generationRound)
 {
@@ -320,8 +316,8 @@ bool DFlashDecoder::decodeStep(DecodingInferenceContext& context)
         context.externalDraftRounds += 1;
         context.externalDraftProposed += external;
         context.externalDraftAccepted += confirmed;
-        // A diverged window: let the draft engine take the next step; the lookup re-aligns after it.
-        mExternalDraftCooldown = confirmed < kExternalDraftMinConfirmed ? 1 : 0;
+        // A diverged window: let the draft engine take the next steps; the lookup re-aligns after them.
+        mExternalDraftCooldown = confirmed < mExternalDraftPolicy.minConfirmed ? mExternalDraftPolicy.cooldown : 0;
     }
 
     return true;
@@ -519,7 +515,7 @@ int32_t DFlashDecoder::stageExternalDraft(DecodingInferenceContext& context)
     check::check(mHostExternalDraft.reshape({1, BS}), "Tensor reshape failed");
     int32_t* host = mHostExternalDraft.dataPointer<int32_t>();
     int32_t const proposed = std::min(context.externalDraft(0, host + 1, mBlockDraft.proposalLen), mBlockDraft.proposalLen);
-    if (proposed < kExternalDraftMinProposal)
+    if (proposed < mExternalDraftPolicy.minProposal)
     {
         return 0;
     }

@@ -38,6 +38,7 @@
 #include "runtime/debug/layerDebugger.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/dflashDecodeUtils.h"
 #include "runtime/decoding/temporalDraft.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/contextCache/blockHash.h"
@@ -663,6 +664,33 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         }
         LOG_INFO("DFlash trajectory-start guard %s (<|cot_end|> %d, <|traj_future_start|> %d)",
             mTrajStartGuard.enabled() ? "on" : "off", mTrajStartGuard.cotEndId, mTrajStartGuard.trajFutureStartId);
+    }
+    if (char const* corpus = std::getenv("EDGELLM_RETRIEVAL_DRAFT"); corpus != nullptr && corpus[0] != '\0')
+    {
+        retrieval_draft::RetrievalDraftConfig config;
+        if (char const* value = std::getenv("EDGELLM_RETRIEVAL_DRAFT_MIN_SUPPORT"))
+        {
+            config.minSupport = std::max(1, std::atoi(value));
+        }
+        if (char const* value = std::getenv("EDGELLM_RETRIEVAL_DRAFT_MIN_SHARE"))
+        {
+            config.minShare = std::clamp(std::atof(value), 0.0, 1.0);
+        }
+        if (char const* value = std::getenv("EDGELLM_RETRIEVAL_DRAFT_MIN_MATCH"))
+        {
+            config.minMatch = std::clamp(std::atoi(value), 1, config.maxMatch);
+        }
+        mRetrievalDraft.corpus = retrieval_draft::RetrievalDraft(config);
+        ELLM_CHECK(mRetrievalDraft.corpus.loadCorpus(corpus),
+            std::string("EDGELLM_RETRIEVAL_DRAFT: ") + corpus
+                + " is not a corpus written by build_alpamayo1_5_coc_corpus.py");
+        mRetrievalDraft.enabled = true;
+        mRetrievalDraft.minProposal = dflash_utils::externalDraftPolicyFromEnv().minProposal;
+        LOG_INFO("Retrieval draft on: %" PRId64 " sequences, %" PRId64 " tokens, %" PRId64
+                 " trie nodes from %s (min support %d, min share %.2f, suffix match %d-%d, min proposal %d)",
+            mRetrievalDraft.corpus.numSequences(), mRetrievalDraft.corpus.numTokens(),
+            mRetrievalDraft.corpus.numNodes(), corpus, config.minSupport, config.minShare, config.minMatch,
+            config.maxMatch, mRetrievalDraft.minProposal);
     }
 
     if (contextCacheConfig.enabled)
@@ -1290,8 +1318,10 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
     }
 
     // Consecutive batch-1 requests are taken to be consecutive windows; a wrong guess only costs acceptance.
-    bool const temporalDraft = mTemporalDraft.enabled && managedRequest == nullptr && request.numLogprobs == 0
-        && decodingStrategy.kind() == DecodingStrategyKind::kDFlash && !mTemporalDraft.previousOutput.empty();
+    bool const externalDraftApplies = managedRequest == nullptr && request.numLogprobs == 0
+        && decodingStrategy.kind() == DecodingStrategyKind::kDFlash;
+    bool const temporalDraft = mTemporalDraft.enabled && externalDraftApplies && !mTemporalDraft.previousOutput.empty();
+    bool const retrievalDraft = mRetrievalDraft.enabled && externalDraftApplies;
 
     // Prefill from the base model; subsequent iterations are delegated to the selected strategy.
     bool prefillStatus;
@@ -1597,14 +1627,30 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
-    if (temporalDraft && context.activeBatchSize == 1)
+    // Rounds whose proposal came from the previous window and from the corpus.
+    int32_t temporalDraftRounds = 0;
+    int32_t retrievalDraftRounds = 0;
+    if ((temporalDraft || retrievalDraft) && context.activeBatchSize == 1)
     {
-        context.externalDraft = [this, &context](int32_t slot, int32_t* out, int32_t capacity) {
+        context.externalDraft = [this, &context, temporalDraft, retrievalDraft, &temporalDraftRounds,
+                                    &retrievalDraftRounds](int32_t slot, int32_t* out, int32_t capacity) {
             auto const& ids = context.tokenIds[slot];
             int32_t const generated = context.currentGenerateLengths[slot];
-            return temporal_draft::propose(mTemporalDraft.previousOutput.data(),
-                static_cast<int32_t>(mTemporalDraft.previousOutput.size()), ids.data() + (ids.size() - generated),
-                generated, mTemporalDraft.minMatch, out, capacity);
+            int32_t const* output = ids.data() + (ids.size() - generated);
+            if (temporalDraft)
+            {
+                int32_t const proposed = temporal_draft::propose(mTemporalDraft.previousOutput.data(),
+                    static_cast<int32_t>(mTemporalDraft.previousOutput.size()), output, generated,
+                    mTemporalDraft.minMatch, out, capacity);
+                if (!retrievalDraft || proposed >= mRetrievalDraft.minProposal)
+                {
+                    temporalDraftRounds += proposed >= mRetrievalDraft.minProposal ? 1 : 0;
+                    return proposed;
+                }
+            }
+            int32_t const proposed = mRetrievalDraft.corpus.propose(output, generated, out, capacity);
+            retrievalDraftRounds += proposed >= mRetrievalDraft.minProposal ? 1 : 0;
+            return proposed;
         };
     }
     if (mTrajStartGuard.enabled() && hasActionRequest
@@ -1700,11 +1746,19 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         }
     }
 
-    if (context.externalDraft)
+    if (context.externalDraft && !retrievalDraft)
     {
         LOG_INFO("Temporal draft: %d of %d rounds verified the previous window's tokens, %d of %d proposed accepted",
             context.externalDraftRounds, context.generationRound, context.externalDraftAccepted,
             context.externalDraftProposed);
+    }
+    else if (context.externalDraft)
+    {
+        LOG_INFO(
+            "Retrieval draft: %d of %d rounds verified external tokens (%d previous window, %d corpus), %d of %d "
+            "proposed accepted",
+            context.externalDraftRounds, context.generationRound, temporalDraftRounds, retrievalDraftRounds,
+            context.externalDraftAccepted, context.externalDraftProposed);
     }
 
     // Few-layer-validation debug: write the accumulated per-layer logits/KV dump for this request.

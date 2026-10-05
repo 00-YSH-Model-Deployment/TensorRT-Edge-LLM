@@ -20,6 +20,8 @@
 #include "common/checkMacros.h"
 #include "kernels/speculative/ddtreeKernels.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <string>
 
 namespace trt_edgellm
@@ -64,6 +66,24 @@ bool shouldUseDDTree(DeploymentConfig const& deployment)
         return false;
     }
     return deployment.specConfig->draftingTopK > 1;
+}
+
+ExternalDraftPolicy externalDraftPolicyFromEnv()
+{
+    ExternalDraftPolicy policy;
+    if (char const* value = std::getenv("EDGELLM_EXTERNAL_DRAFT_MIN_PROPOSAL"))
+    {
+        policy.minProposal = std::max(1, std::atoi(value));
+    }
+    if (char const* value = std::getenv("EDGELLM_EXTERNAL_DRAFT_MIN_CONFIRMED"))
+    {
+        policy.minConfirmed = std::max(0, std::atoi(value));
+    }
+    if (char const* value = std::getenv("EDGELLM_EXTERNAL_DRAFT_COOLDOWN"))
+    {
+        policy.cooldown = std::max(0, std::atoi(value));
+    }
+    return policy;
 }
 
 CachedBlockDraftRuntimeConfig makeCachedBlockDraftRuntimeConfig(DeploymentConfig const& deployment)

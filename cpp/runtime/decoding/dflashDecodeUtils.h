@@ -70,6 +70,18 @@ int32_t runtimeBlockSize(DeploymentConfig const& deployment);
 //! DDTree proposal when draftingTopK > 1.
 bool shouldUseDDTree(DeploymentConfig const& deployment);
 
+//! When a host proposal (DecodingInferenceContext::externalDraft) replaces the draft engine's block.
+struct ExternalDraftPolicy
+{
+    int32_t minProposal{3};  //!< A shorter proposal is left to the draft engine, which proposes the whole block
+    int32_t minConfirmed{2}; //!< A step that confirms fewer proposed tokens than this starts a cooldown
+    int32_t cooldown{1};     //!< Draft-engine steps taken before the external draft is asked again
+};
+
+//! The defaults above, overridden by EDGELLM_EXTERNAL_DRAFT_MIN_PROPOSAL, EDGELLM_EXTERNAL_DRAFT_MIN_CONFIRMED and
+//! EDGELLM_EXTERNAL_DRAFT_COOLDOWN.
+ExternalDraftPolicy externalDraftPolicyFromEnv();
+
 } // namespace dflash_utils
 } // namespace rt
 } // namespace trt_edgellm

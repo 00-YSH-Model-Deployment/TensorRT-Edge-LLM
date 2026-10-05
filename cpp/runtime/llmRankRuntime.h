@@ -28,6 +28,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/logitBias.h"
+#include "runtime/decoding/retrievalDraft.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
@@ -387,6 +388,18 @@ private:
         }
     };
     TrajStartGuard mTrajStartGuard;
+
+    //! Retrieval draft (EDGELLM_RETRIEVAL_DRAFT=<corpus>, DFlash, batch 1): the majority continuation of the
+    //! current output in a corpus of generated chain-of-causation sequences (retrievalDraft.h), asked when the
+    //! temporal draft is off or has no proposal the decoder would take. Verification is unchanged, so the output
+    //! is the base model's.
+    struct RetrievalDraftState
+    {
+        bool enabled{false};
+        int32_t minProposal{3}; //!< Shortest proposal the decoder takes (dflash_utils::ExternalDraftPolicy)
+        retrieval_draft::RetrievalDraft corpus;
+    };
+    RetrievalDraftState mRetrievalDraft;
 
     //! Vision blocks ([VS] image tokens [VE]) of a prompt, in prompt order.
     std::vector<std::pair<int32_t, int32_t>> findFrameBlocks(std::vector<int32_t> const& ids) const;

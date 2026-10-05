@@ -157,6 +157,7 @@ private:
     //! External draft (context.externalDraft): host staging [B, blockSize] for proposals; slot 0 is the root.
     Tensor mHostExternalDraft;
     int32_t mExternalDraftCooldown{0}; //!< Draft-engine steps to take before trying the external draft again
+    dflash_utils::ExternalDraftPolicy mExternalDraftPolicy{dflash_utils::externalDraftPolicyFromEnv()};
 
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 
