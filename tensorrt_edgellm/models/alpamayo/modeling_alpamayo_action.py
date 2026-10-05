@@ -233,6 +233,15 @@ class ActionAttention(nn.Module):
         present_k = kv_cache_update_onnx(k_cache, k, kvcache_start_index)
         present_v = kv_cache_update_onnx(v_cache, v, kvcache_start_index)
 
+        # Fold each KV head's group of query heads into the query axis (q head h
+        # uses KV head h // group). Exact here: attention is non-causal and every
+        # query row sees the same keys. Without it TRT replicates the whole cache
+        # per query head on every denoise step, which cost as much as the GEMMs.
+        group = self.num_heads // self.num_kv_heads
+        if group > 1:
+            q = q.reshape(bsz, self.num_kv_heads, group * q_len, self.head_dim)
+            attention_mask = attention_mask.repeat(1, 1, group, 1)
+
         # Pass full cache to attention; the mask handles invalid positions.
         attn_output = attention_onnx(
             q,
@@ -242,6 +251,10 @@ class ActionAttention(nn.Module):
             is_causal=False,
             scale=self.attention_scale,
         )
+        if group > 1:
+            attn_output = attn_output.reshape(bsz, self.num_heads, q_len,
+                                              self.head_dim)
+
         # Reshape and project
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
