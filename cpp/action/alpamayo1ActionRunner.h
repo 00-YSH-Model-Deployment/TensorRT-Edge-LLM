@@ -70,7 +70,7 @@ public:
     Alpamayo1ActionRunner(std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream,
         KVCacheManager::Config const& kvCacheConfig);
 
-    ~Alpamayo1ActionRunner() noexcept = default;
+    ~Alpamayo1ActionRunner() noexcept;
 
     //! \brief Get the required context memory size for this engine
     //! \return Required context memory size in bytes
@@ -120,16 +120,16 @@ public:
         tokenizer::Tokenizer const* tokenizer);
 
 private:
-    // Number of denoising steps run by the diffusion head. 10 unless EDGELLM_ALPAMAYO_DENOISE_STEPS
-    // says otherwise; EDGELLM_ALPAMAYO_CACHE_STEPS (comma list, never 0) names the steps that reuse the
-    // last computed velocity instead of running the action engine (FlashDrive's action caching).
-    int32_t mNumDenoiseSteps{10};
-    std::vector<bool> mCacheStep{};
+    // Flow time grid 0 = t_0 < ... < t_n = 1: the action engine runs once per interval, an Euler step from t_k to
+    // t_{k+1}. EDGELLM_ALPAMAYO_TIME_GRID (comma list) sets it directly. Otherwise it is the uniform grid of
+    // EDGELLM_ALPAMAYO_DENOISE_STEPS steps (default 10) with the steps named in EDGELLM_ALPAMAYO_CACHE_STEPS
+    // (comma list, never 0) folded into the computed step before them (action_utils::foldCachedEulerSteps).
+    std::vector<float> mTimeGrid{};
     // Scale of the initial noise, EDGELLM_ALPAMAYO_NOISE_SCALE (default 1). 0 starts every flow from the
     // mean action, the PyTorch runner's diffusion_temperature=0: one deterministic trajectory per request.
     float mNoiseScale{1.0F};
 
-    //! \brief Read the denoise step count, cached steps and noise scale from the environment
+    //! \brief Read the flow time grid and noise scale from the environment
     void parseDenoiseSchedule();
 
     //! \brief Allocate tensors for the action runner
@@ -151,6 +151,26 @@ private:
     //! \brief Load model fields from config.json (e.g. rope_theta, num_hidden_layers).
     bool parseModelConfig(std::string const& configPath);
 
+    //! \brief Set the input shapes and the addresses that are the same for every flow step. Skipped while the
+    //! batch size and KV length buffer are those of the previous call.
+    //! \throws std::runtime_error If a shape or address is rejected
+    void bindStaticTensors(int32_t activeBatchSize, void* kvLengthsDevice);
+
+    //! \brief Trajectory buffer holding the state at time-grid point k: the noise buffer for even k (k = 0 is the
+    //! initial noise), the denoised buffer for odd k
+    void* trajectoryBuffer(int32_t k) noexcept;
+
+    //! \brief Enqueue one action engine call per time-grid interval
+    //! \return false if an address is rejected or enqueueV3 fails
+    bool enqueueDenoiseSteps(cudaStream_t stream);
+
+    //! \brief Capture enqueueDenoiseSteps for activeBatchSize into a CUDA graph; disables graphs on failure.
+    //! The stream must be idle.
+    void captureDenoiseGraph(int32_t activeBatchSize, cudaStream_t stream);
+
+    //! \brief Destroy the captured denoise graphs
+    void resetDenoiseGraphs() noexcept;
+
     cudaStream_t mStream{nullptr};
     action::ActionModelType mModelType{action::ActionModelType::ALPAMAYO1};
     int32_t mNoiseSeed{5};  //!< Random seed for diffusion noise trajectory initialization
@@ -166,10 +186,8 @@ private:
     rt::Tensor mNoiseTrajectoryHost;
     rt::Tensor mDenoisedTrajectoryDevice;
     rt::Tensor mDenoisedTrajectoryHost;
-    rt::Tensor mTimeStepsT0Device;
-    rt::Tensor mTimeStepsT1Device;
-    rt::Tensor mTimeStepsT0Host;
-    rt::Tensor mTimeStepsT1Host;
+    rt::Tensor mTimeGridDevice; //!< mTimeGrid, one 256-byte slot per point
+    rt::Tensor mTimeGridHost;
     rt::Tensor mRopeCosSinDevice;
     rt::Tensor mPositionIdsHost;
     rt::Tensor mPositionIdsDevice;
@@ -183,6 +201,21 @@ private:
     int32_t mMaxActionBatchSize{0};
     std::vector<rt::Tensor> mKCacheLayers;
     std::vector<rt::Tensor> mVCacheLayers;
+
+    int32_t mBoundBatchSize{0};           //!< Batch size of the static bindings, 0 if none are valid
+    void const* mBoundKvLengths{nullptr}; //!< KV length buffer bound as kvcache_start_index
+
+    //! CUDA graphs of the whole flow loop, one per batch size (EDGELLM_ALPAMAYO_ACTION_CUDA_GRAPH=1). They bake in
+    //! every engine address and the context memory, so they are dropped when the KV length buffer or the context
+    //! memory changes.
+    struct DenoiseGraph
+    {
+        int32_t batchSize{0};
+        cudaGraph_t graph{nullptr};
+        cudaGraphExec_t exec{nullptr};
+    };
+    bool mUseCudaGraph{false};
+    std::vector<DenoiseGraph> mDenoiseGraphs{};
 };
 
 } // namespace rt
