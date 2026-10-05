@@ -539,8 +539,17 @@ void Alpamayo1ActionRunner::parseDenoiseSchedule()
             pos = end + 1;
         }
     }
+    if (char const* scale = std::getenv("EDGELLM_ALPAMAYO_NOISE_SCALE"))
+    {
+        mNoiseScale = std::stof(scale);
+        if (mNoiseScale < 0.0F)
+        {
+            throw std::runtime_error("EDGELLM_ALPAMAYO_NOISE_SCALE must be >= 0");
+        }
+    }
     int32_t const cached = static_cast<int32_t>(std::count(mCacheStep.begin(), mCacheStep.end(), true));
-    LOG_INFO("Alpamayo denoise schedule: %d steps, %d reuse the cached velocity", mNumDenoiseSteps, cached);
+    LOG_INFO("Alpamayo denoise schedule: %d steps, %d reuse the cached velocity, noise scale %.3f", mNumDenoiseSteps,
+        cached, mNoiseScale);
 }
 
 void Alpamayo1ActionRunner::allocateTensors(KVCacheManager::Config const& kvCacheConfig)
@@ -631,7 +640,7 @@ void Alpamayo1ActionRunner::initializeNoiseTrajectory(int32_t randomSeed, int32_
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (size_t i = 0; i < elemCount; ++i)
     {
-        data[i] = dist(generator);
+        data[i] = mNoiseScale * dist(generator);
     }
 }
 

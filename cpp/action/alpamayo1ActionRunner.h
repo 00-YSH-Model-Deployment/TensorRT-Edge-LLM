@@ -125,8 +125,11 @@ private:
     // last computed velocity instead of running the action engine (FlashDrive's action caching).
     int32_t mNumDenoiseSteps{10};
     std::vector<bool> mCacheStep{};
+    // Scale of the initial noise, EDGELLM_ALPAMAYO_NOISE_SCALE (default 1). 0 starts every flow from the
+    // mean action, the PyTorch runner's diffusion_temperature=0: one deterministic trajectory per request.
+    float mNoiseScale{1.0F};
 
-    //! \brief Read the denoise step count and cached steps from the environment
+    //! \brief Read the denoise step count, cached steps and noise scale from the environment
     void parseDenoiseSchedule();
 
     //! \brief Allocate tensors for the action runner
