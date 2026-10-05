@@ -26,18 +26,32 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from ...config import ActionConfig
+from ..linear import make_linear
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Action input projection
 # ---------------------------------------------------------------------------
+
+
+def _expert_linear(model_config: "Optional[ModelConfig]", in_features: int,
+                   out_features: int, module_name: str) -> nn.Module:
+    """Expert projection: plain FP16 without a model config, else whatever the
+    checkpoint quantized it to. ``module_name`` is the checkpoint path."""
+    if model_config is None:
+        return nn.Linear(in_features, out_features, bias=False)
+    return make_linear(model_config, in_features, out_features, bias=False,
+                       module_name=module_name)
 
 
 class FourierEncoder(nn.Module):
@@ -150,7 +164,10 @@ class ActionAttention(nn.Module):
     nodes in the default domain.
     """
 
-    def __init__(self, cfg: ActionConfig) -> None:
+    def __init__(self,
+                 cfg: ActionConfig,
+                 model_config: "Optional[ModelConfig]" = None,
+                 prefix: str = "") -> None:
         super().__init__()
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
@@ -158,18 +175,18 @@ class ActionAttention(nn.Module):
         self.hidden_size = cfg.hidden_size
         self.attention_scale = float(cfg.attention_scaling)
 
-        self.q_proj = nn.Linear(cfg.hidden_size,
-                                self.num_heads * self.head_dim,
-                                bias=False)
-        self.k_proj = nn.Linear(cfg.hidden_size,
-                                self.num_kv_heads * self.head_dim,
-                                bias=False)
-        self.v_proj = nn.Linear(cfg.hidden_size,
-                                self.num_kv_heads * self.head_dim,
-                                bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim,
-                                cfg.hidden_size,
-                                bias=False)
+        self.q_proj = _expert_linear(model_config, cfg.hidden_size,
+                                     self.num_heads * self.head_dim,
+                                     f"{prefix}.q_proj")
+        self.k_proj = _expert_linear(model_config, cfg.hidden_size,
+                                     self.num_kv_heads * self.head_dim,
+                                     f"{prefix}.k_proj")
+        self.v_proj = _expert_linear(model_config, cfg.hidden_size,
+                                     self.num_kv_heads * self.head_dim,
+                                     f"{prefix}.v_proj")
+        self.o_proj = _expert_linear(model_config,
+                                     self.num_heads * self.head_dim,
+                                     cfg.hidden_size, f"{prefix}.o_proj")
         self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
@@ -225,7 +242,6 @@ class ActionAttention(nn.Module):
             is_causal=False,
             scale=self.attention_scale,
         )
-
         # Reshape and project
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
@@ -235,22 +251,27 @@ class ActionAttention(nn.Module):
 class ActionDecoderLayer(nn.Module):
     """Pre-norm transformer block for the action expert."""
 
-    def __init__(self, cfg: ActionConfig) -> None:
+    def __init__(self,
+                 cfg: ActionConfig,
+                 model_config: "Optional[ModelConfig]" = None,
+                 prefix: str = "") -> None:
         super().__init__()
-        self.self_attn = ActionAttention(cfg)
+        self.self_attn = ActionAttention(cfg, model_config,
+                                         f"{prefix}.self_attn")
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size,
                                                 eps=cfg.rms_norm_eps)
         # SwiGLU MLP
-        self.mlp_gate_proj = nn.Linear(cfg.hidden_size,
-                                       cfg.intermediate_size,
-                                       bias=False)
-        self.mlp_up_proj = nn.Linear(cfg.hidden_size,
-                                     cfg.intermediate_size,
-                                     bias=False)
-        self.mlp_down_proj = nn.Linear(cfg.intermediate_size,
-                                       cfg.hidden_size,
-                                       bias=False)
+        self.mlp_gate_proj = _expert_linear(model_config, cfg.hidden_size,
+                                            cfg.intermediate_size,
+                                            f"{prefix}.mlp.gate_proj")
+        self.mlp_up_proj = _expert_linear(model_config, cfg.hidden_size,
+                                          cfg.intermediate_size,
+                                          f"{prefix}.mlp.up_proj")
+        self.mlp_down_proj = _expert_linear(model_config,
+                                            cfg.intermediate_size,
+                                            cfg.hidden_size,
+                                            f"{prefix}.mlp.down_proj")
 
     def forward(
         self,
@@ -291,10 +312,14 @@ class ActionDecoderLayer(nn.Module):
 class ActionExpert(nn.Module):
     """Stack of ActionDecoderLayers + final RMSNorm."""
 
-    def __init__(self, cfg: ActionConfig) -> None:
+    def __init__(self,
+                 cfg: ActionConfig,
+                 model_config: "Optional[ModelConfig]" = None) -> None:
         super().__init__()
-        self.layers = nn.ModuleList(
-            [ActionDecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            ActionDecoderLayer(cfg, model_config, f"expert.layers.{i}")
+            for i in range(cfg.num_hidden_layers)
+        ])
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(
@@ -336,13 +361,15 @@ class ActionExpert(nn.Module):
 class AlpamayoAction(nn.Module):
     """Wraps one flow-matching denoising step for ONNX export."""
 
-    def __init__(self, cfg: ActionConfig) -> None:
+    def __init__(self,
+                 cfg: ActionConfig,
+                 model_config: "Optional[ModelConfig]" = None) -> None:
         super().__init__()
         self.cfg = cfg
         self.n_layers = cfg.num_hidden_layers
         self.n_diffusion_tokens = cfg.n_diffusion_tokens
         self.action_in_proj = ActionInProjection(cfg)
-        self.expert = ActionExpert(cfg)
+        self.expert = ActionExpert(cfg, model_config)
         self.action_out_proj = nn.Linear(cfg.hidden_size, 2, bias=True)
 
     def forward(
@@ -546,11 +573,34 @@ def _load_action_weights(model: AlpamayoAction, weights: dict,
     logger.info("Loaded %d action expert tensors", loaded)
 
 
-def build_alpamayo_1_action(cfg: ActionConfig, weights: dict,
-                            dtype: torch.dtype) -> AlpamayoAction:
-    """Construct AlpamayoAction, load weights, return in eval mode."""
-    model = AlpamayoAction(cfg)
+def _action_key(ckpt_key: str) -> Optional[str]:
+    """Checkpoint key -> model path, or None for keys outside the action model."""
+    if not ckpt_key.startswith(("expert.", "action_in_proj.", "action_out_proj.")):
+        return None
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        ckpt_key = ckpt_key.replace(f".mlp.{proj}", f".mlp_{proj}")
+    return ckpt_key
+
+
+def build_alpamayo_1_action(
+        cfg: ActionConfig,
+        weights: dict,
+        dtype: torch.dtype,
+        model_config: "Optional[ModelConfig]" = None) -> AlpamayoAction:
+    """Construct AlpamayoAction, load weights, return in eval mode.
+
+    With ``model_config`` the expert projections follow the checkpoint's
+    quantization (``make_linear``); the in/out projections stay FP16.
+    """
+    model = AlpamayoAction(cfg, model_config)
     model = model.to(dtype)
-    _load_action_weights(model, weights, dtype)
+    if model_config is None:
+        _load_action_weights(model, weights, dtype)
+    else:
+        # The shared loader keeps quantized dtypes and runs the repacking the
+        # exporter expects (packed NVFP4 as int8, FP8 scales as FP16), as the
+        # visual tower's loader does.
+        from ...checkpoint.loader import load_submodule_weights
+        load_submodule_weights(model, weights, _action_key, label="action")
     model.eval()
     return model

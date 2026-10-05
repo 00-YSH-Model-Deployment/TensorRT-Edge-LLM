@@ -3621,10 +3621,19 @@ def _build_action_config(root_cfg: dict, weights: dict):
     )
 
 
-def _export_action(model_dir: str, action_out_dir: str, weights: dict,
-                   config: dict, max_kv_cache_capacity: int,
-                   dtype: "torch.dtype") -> None:
-    """Export Alpamayo action expert to ONNX."""
+def _export_action(model_dir: str,
+                   action_out_dir: str,
+                   weights: dict,
+                   config: dict,
+                   max_kv_cache_capacity: int,
+                   dtype: "torch.dtype",
+                   model_config: "Optional[ModelConfig]" = None) -> None:
+    """Export Alpamayo action expert to ONNX.
+
+    The expert follows ``model_config``'s quantization only when the checkpoint
+    actually quantized it (``expert.*.weight_scale`` present); otherwise it is
+    exported in FP16, whatever the LLM's quantization.
+    """
     os.makedirs(action_out_dir, exist_ok=True)
     output_path = os.path.join(action_out_dir, "model.onnx")
 
@@ -3638,12 +3647,19 @@ def _export_action(model_dir: str, action_out_dir: str, weights: dict,
     try:
         from ..onnx.export_encoder import (export_action_onnx,
                                            write_action_config)
+        quantized = any(
+            k.startswith("expert.layers.") and k.endswith(".weight_scale")
+            for k in weights)
+        if quantized:
+            logger.info("[Action] Expert projections are quantized (%s)",
+                        model_config.quant.quant_type)
         export_action_onnx(
             output_path=output_path,
             weights=weights,
             config=action_cfg,
             max_kv_cache_capacity=max_kv_cache_capacity,
             dtype=dtype,
+            model_config=model_config if quantized else None,
         )
         write_action_config(action_cfg, max_kv_cache_capacity, action_out_dir)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -4547,7 +4563,8 @@ def main() -> None:
              _get_weights(),
              config,
              max_kv_cache_capacity=args.max_kv_cache_capacity,
-             dtype=dtype))
+             dtype=dtype,
+             model_config=_get_model_config()))
     ]
 
     logger.info("=" * 60)

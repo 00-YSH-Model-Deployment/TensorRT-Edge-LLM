@@ -506,6 +506,7 @@ def export_action_onnx(
     config: "ActionConfig",
     max_kv_cache_capacity: int,
     dtype: torch.dtype = torch.float16,
+    model_config: "ModelConfig | None" = None,
 ) -> None:
     """Export Alpamayo action expert (one flow-matching step) to ONNX.
 
@@ -516,6 +517,8 @@ def export_action_onnx(
         config:      :class:`~config.ActionConfig` with expert hyperparameters.
         max_kv_cache_capacity: Fixed KV cache capacity (must match LLM engine).
         dtype:       Weight dtype (default ``float16``).
+        model_config: Top-level ``ModelConfig`` of a checkpoint whose expert
+                     projections are quantized; ``None`` exports FP16.
     """
     device = "cpu"
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -523,7 +526,7 @@ def export_action_onnx(
     from ..models.alpamayo.modeling_alpamayo_action import \
         build_alpamayo_1_action
     logger.info("Building Alpamayo action expert ...")
-    model = build_alpamayo_1_action(config, weights, dtype)
+    model = build_alpamayo_1_action(config, weights, dtype, model_config)
     model = model.to(device)
     model.eval()
 
@@ -532,6 +535,16 @@ def export_action_onnx(
 
     _run_dynamo_export(model, dynamo_inputs, output_path, onnx_input_names,
                        output_names, dynamic_shapes)
+
+    # Same TRT-compat passes as the visual and LLM paths for quantized weights.
+    if model_config is not None:
+        nvfp4 = model_config.quant.uses_nvfp4_weights
+        if nvfp4:
+            _fix_nvfp4_weight_dtype(output_path)
+        # RMSNorm computes in FP32 inside the graph; keep those constants.
+        _fix_initializer_dtypes(output_path,
+                                dedup_dql_scales=nvfp4,
+                                cast_fp32_weights_to_fp16=False)
 
 
 def write_action_config(config: "ActionConfig", max_kv_cache_capacity: int,
