@@ -88,6 +88,14 @@ cd /path/to/TensorRT-Edge-LLM
 `action_build` writes `$WORKSPACE_DIR/$MODEL_NAME/engines/action/`. Both
 subdirectories are loaded through `--multimodalEngineDir` during inference.
 
+TensorRT picks tactics for each profile's optimal shape, which defaults to the
+maximum batch and half of `--maxInputLen`. To tune for the shapes a deployment
+actually runs, pass `--optBatchSize` to `action_build` (for example 1 when one
+trajectory is sampled per request), `--optInputLen` to `llm_build` (the typical
+prompt length), and optionally set `EDGELLM_BUILDER_OPT_LEVEL` (0-5, TensorRT
+default 3) for any builder. All three leave the engine's supported shape ranges
+unchanged.
+
 ## Step 4: Run Inference (Thor Device)
 
 Create an input file `$WORKSPACE_DIR/input_action.json`. The `trajectory`

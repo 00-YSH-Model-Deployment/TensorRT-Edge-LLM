@@ -80,6 +80,8 @@ struct LLMBuilderConfig
 
     int64_t tpSize{1}; //!< Tensor parallel size
     int64_t tpRank{0}; //!< Tensor parallel rank
+    //! Prompt length TensorRT tunes the context profile for (kOPT sequence dimension). Zero selects maxInputLen / 2.
+    int64_t optInputLen{0};
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -94,6 +96,10 @@ struct LLMBuilderConfig
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         json["max_kv_pool_pages"] = resolvedKVPoolPages();
         json["tp_size"] = tpSize;
+        if (optInputLen > 0)
+        {
+            json["opt_input_len"] = optInputLen;
+        }
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -161,6 +167,10 @@ struct LLMBuilderConfig
         {
             config.tpSize = json["tp_size"];
         }
+        if (json.contains("opt_input_len"))
+        {
+            config.optInputLen = json["opt_input_len"];
+        }
         return config;
     }
 
@@ -179,6 +189,10 @@ struct LLMBuilderConfig
         oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
         oss << "  tpSize: " << tpSize << "\n";
         oss << "  tpRank: " << tpRank << "\n";
+        if (optInputLen > 0)
+        {
+            oss << "  optInputLen: " << optInputLen << "\n";
+        }
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -284,6 +298,10 @@ private:
     //! @param maxToken The `max` shape count for this profile
     //!                 (e.g., `maxVerifyTreeSize` for verify, `maxDraftTreeSize` for draft).
     int64_t effectiveOptTokens(int64_t maxToken) const;
+
+    //! kOPT sequence length of context-profile (prefill) inputs.
+    //! @return optInputLen when set, otherwise max(1, maxInputLen / 2)
+    int64_t contextOptInputLen() const;
 
     //! Set up optimization profiles for speculative tree-decoding models.
     //! Configures hidden-state and attention-mask inputs used by spec decode.

@@ -316,6 +316,24 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
     config->setPreviewFeature(nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03, true);
 #endif
 
+    char const* levelEnv = std::getenv("EDGELLM_BUILDER_OPT_LEVEL");
+    if (levelEnv != nullptr && *levelEnv != '\0')
+    {
+        char* end = nullptr;
+        long const level = std::strtol(levelEnv, &end, 10);
+        if (end == levelEnv || *end != '\0' || level < 0 || level > 5)
+        {
+            LOG_ERROR("EDGELLM_BUILDER_OPT_LEVEL must be an integer in [0, 5], got '%s'", levelEnv);
+            return nullptr;
+        }
+#if IS_TRT_RTX
+        LOG_WARNING("EDGELLM_BUILDER_OPT_LEVEL is ignored by TensorRT-RTX builds");
+#else
+        config->setBuilderOptimizationLevel(static_cast<int32_t>(level));
+        LOG_INFO("TensorRT builder optimization level set to %ld", level);
+#endif
+    }
+
     return config;
 }
 

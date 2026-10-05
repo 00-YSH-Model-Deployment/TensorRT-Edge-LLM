@@ -32,7 +32,8 @@ enum ActionBuildOptionId : int
     ONNX_DIR = 702,
     ENGINE_DIR = 703,
     DEBUG = 704,
-    MAX_BATCH_SIZE = 705
+    MAX_BATCH_SIZE = 705,
+    OPT_BATCH_SIZE = 706
 };
 
 struct ActionBuildArgs
@@ -42,12 +43,14 @@ struct ActionBuildArgs
     bool help{false};
     bool debug{false};
     int32_t maxBatchSize{4};
+    int32_t optBatchSize{0};
 };
 
 static void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] <--onnxDir str> <--engineDir str> [--debug] [--maxBatchSize int] " << std::endl;
+              << " [--help] <--onnxDir str> <--engineDir str> [--debug] [--maxBatchSize int] [--optBatchSize int] "
+              << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                 Display this help message" << std::endl;
     std::cerr << "  --onnxDir              Directory containing the action expert ONNX (model.onnx and config.json). "
@@ -57,6 +60,9 @@ static void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --debug                Enable verbose logging" << std::endl;
     std::cerr << "  --maxBatchSize         Maximum batch size for optimization profiles (default: 4)" << std::endl;
+    std::cerr << "  --optBatchSize         Batch size TensorRT tunes tactics for, in [1, maxBatchSize] "
+                 "(default: maxBatchSize)"
+              << std::endl;
 }
 
 static bool parseActionBuildArgs(ActionBuildArgs& args, int argc, char* argv[])
@@ -65,7 +71,8 @@ static bool parseActionBuildArgs(ActionBuildArgs& args, int argc, char* argv[])
         {"onnxDir", required_argument, 0, ActionBuildOptionId::ONNX_DIR},
         {"engineDir", required_argument, 0, ActionBuildOptionId::ENGINE_DIR},
         {"debug", no_argument, 0, ActionBuildOptionId::DEBUG},
-        {"maxBatchSize", required_argument, 0, ActionBuildOptionId::MAX_BATCH_SIZE}, {0, 0, 0, 0}};
+        {"maxBatchSize", required_argument, 0, ActionBuildOptionId::MAX_BATCH_SIZE},
+        {"optBatchSize", required_argument, 0, ActionBuildOptionId::OPT_BATCH_SIZE}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -95,6 +102,10 @@ static bool parseActionBuildArgs(ActionBuildArgs& args, int argc, char* argv[])
         case ActionBuildOptionId::MAX_BATCH_SIZE:
             if (optarg)
                 args.maxBatchSize = std::stoi(optarg);
+            break;
+        case ActionBuildOptionId::OPT_BATCH_SIZE:
+            if (optarg)
+                args.optBatchSize = std::stoi(optarg);
             break;
         default: LOG_ERROR("Invalid argument"); return false;
         }
@@ -137,6 +148,7 @@ int main(int argc, char** argv)
 
     builder::ActionBuilderConfig config;
     config.maxBatchSize = args.maxBatchSize;
+    config.optBatchSize = args.optBatchSize;
 
     std::string actualEngineDir = args.engineDir + "/action";
 

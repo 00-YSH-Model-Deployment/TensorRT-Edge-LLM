@@ -151,25 +151,31 @@ bool ActionBuilder::setupActionOptimizationProfile(
     auto* profile = builder.createOptimizationProfile();
     bool result = true;
 
+    int32_t const optBatch = mBuilderConfig.resolvedOptBatchSize();
+    if (mBuilderConfig.optBatchSize < 0 || optBatch < 1 || optBatch > mBuilderConfig.maxBatchSize)
+    {
+        LOG_ERROR("Action opt batch size %d must be in [1, maxBatchSize=%d], or 0 for maxBatchSize",
+            mBuilderConfig.optBatchSize, mBuilderConfig.maxBatchSize);
+        return false;
+    }
+
     // kvcache_start_index: [batch] — one past-KV length per batch row
     result &= setOptimizationProfile(profile, binding_names::kKVCacheStartIndex, createDims({1}),
-        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        createDims({optBatch}), createDims({mBuilderConfig.maxBatchSize}));
 
     // noise_trajectory: [batch, num_waypoints, 2]
     result &= setOptimizationProfile(profile, binding_names::kNoiseTrajectory, createDims({1, mNumDiffusionTokens, 2}),
-        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, 2}),
+        createDims({optBatch, mNumDiffusionTokens, 2}),
         createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, 2}));
 
     // rope_rotary_cos_sin: [batch, num_diffusion_tokens, head_dim]
-    result
-        &= setOptimizationProfile(profile, binding_names::kRopeCosSin, createDims({1, mNumDiffusionTokens, mHeadDim}),
-            createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, mHeadDim}),
-            createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, mHeadDim}));
+    result &= setOptimizationProfile(profile, binding_names::kRopeCosSin,
+        createDims({1, mNumDiffusionTokens, mHeadDim}), createDims({optBatch, mNumDiffusionTokens, mHeadDim}),
+        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, mHeadDim}));
 
     // attention_pos_id: [batch, num_diffusion_tokens]
     result &= setOptimizationProfile(profile, binding_names::kAttentionPosId, createDims({1, mNumDiffusionTokens}),
-        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens}),
-        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens}));
+        createDims({optBatch, mNumDiffusionTokens}), createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens}));
 
     // k_cache, v_cache: [batch, num_heads, max_capacity, head_dim]
     int32_t maxKVCacheCapacity = 0;
@@ -194,7 +200,7 @@ bool ActionBuilder::setupActionOptimizationProfile(
     mBuilderConfig.maxKVCacheCapacity = maxKVCacheCapacity;
 
     nvinfer1::Dims minCacheDims = createDims({1, mNumHeads, maxKVCacheCapacity, mHeadDim});
-    nvinfer1::Dims optCacheDims = createDims({mBuilderConfig.maxBatchSize, mNumHeads, maxKVCacheCapacity, mHeadDim});
+    nvinfer1::Dims optCacheDims = createDims({optBatch, mNumHeads, maxKVCacheCapacity, mHeadDim});
     nvinfer1::Dims maxCacheDims = createDims({mBuilderConfig.maxBatchSize, mNumHeads, maxKVCacheCapacity, mHeadDim});
 
     for (int32_t i = 0; i < mNumLayers; ++i)

@@ -49,7 +49,8 @@ enum LLMBuildOptionId : int
     MAX_KV_POOL_PAGES = 714,
     TP_SIZE = 715,
     TP_RANK = 716,
-    LOCAL_DEVICE = 717
+    LOCAL_DEVICE = 717,
+    OPT_INPUT_LEN = 718
 };
 
 struct LLMBuildArgs
@@ -58,6 +59,7 @@ struct LLMBuildArgs
     std::string onnxDir;
     std::string engineDir;
     int64_t maxInputLen{1024};
+    int64_t optInputLen{0};
     int64_t maxKVCacheCapacity{4096};
     int64_t maxKVPoolPages{0};
     bool debug{false};
@@ -90,7 +92,7 @@ std::string getInputConfigFileName(int tpSize, int tpRank)
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
+              << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] [--optInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  " [--maxKVPoolPages <int>]"
                  " [--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
@@ -103,6 +105,9 @@ void printUsage(char const* programName)
     std::cerr << "  --engineDir               Provide the output TensorRT engine directory path. Required. "
               << std::endl;
     std::cerr << "  --maxInputLen             Provide the maximum input length for the model. Default = 1024"
+              << std::endl;
+    std::cerr << "  --optInputLen             Prefill length TensorRT tunes the context profile for, in [1, "
+                 "maxInputLen]. Default = 0 (maxInputLen / 2)"
               << std::endl;
     std::cerr << "  --maxKVCacheCapacity      Provide the maximum KV cache capacity (sequence length). "
                  "Default = 4096"
@@ -144,6 +149,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"onnxDir", required_argument, 0, LLMBuildOptionId::ONNX_DIR},
         {"engineDir", required_argument, 0, LLMBuildOptionId::ENGINE_DIR},
         {"maxInputLen", required_argument, 0, LLMBuildOptionId::MAX_INPUT_LEN},
+        {"optInputLen", required_argument, 0, LLMBuildOptionId::OPT_INPUT_LEN},
         {"maxKVCacheCapacity", required_argument, 0, LLMBuildOptionId::MAX_KV_CACHE_CAPACITY},
         {"maxKVPoolPages", required_argument, 0, LLMBuildOptionId::MAX_KV_POOL_PAGES},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
@@ -192,6 +198,12 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
             if (optarg)
             {
                 args.maxInputLen = std::stoi(optarg);
+            }
+            break;
+        case LLMBuildOptionId::OPT_INPUT_LEN:
+            if (optarg)
+            {
+                args.optInputLen = std::stoll(optarg);
             }
             break;
         case LLMBuildOptionId::MAX_KV_CACHE_CAPACITY:
@@ -357,6 +369,7 @@ int main(int argc, char** argv)
     // Create LLMBuilderConfig from args
     builder::LLMBuilderConfig config;
     config.maxInputLen = args.maxInputLen;
+    config.optInputLen = args.optInputLen;
     config.maxKVCacheCapacity = args.maxKVCacheCapacity;
     config.maxKVPoolPages = args.maxKVPoolPages;
     config.maxBatchSize = args.maxBatchSize;

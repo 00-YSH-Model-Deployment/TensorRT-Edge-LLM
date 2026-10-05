@@ -43,6 +43,16 @@ struct ActionBuilderConfig
     //! maxKVCacheCapacity as long as every action request's KV length plus n_diffusion_tokens fits.
     int32_t maxKVCacheCapacity{0};
 
+    //! Batch size TensorRT tunes tactics for (profile kOPT). Zero selects maxBatchSize.
+    int32_t optBatchSize{0};
+
+    //! Resolve the profile kOPT batch size.
+    //! @return optBatchSize, or maxBatchSize when it is zero
+    int32_t resolvedOptBatchSize() const noexcept
+    {
+        return optBatchSize > 0 ? optBatchSize : maxBatchSize;
+    }
+
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
     Json toJson() const
@@ -50,6 +60,10 @@ struct ActionBuilderConfig
         Json json;
         json["max_batch_size"] = maxBatchSize;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        if (optBatchSize > 0)
+        {
+            json["opt_batch_size"] = optBatchSize;
+        }
         return json;
     }
 
@@ -67,6 +81,10 @@ struct ActionBuilderConfig
         {
             config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
+        if (json.contains("opt_batch_size"))
+        {
+            config.optBatchSize = json["opt_batch_size"];
+        }
         return config;
     }
 
@@ -78,6 +96,10 @@ struct ActionBuilderConfig
         oss << "ActionBuilderConfig:\n";
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
+        if (optBatchSize > 0)
+        {
+            oss << "  optBatchSize: " << optBatchSize << "\n";
+        }
         return oss.str();
     }
 };

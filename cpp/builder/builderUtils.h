@@ -90,8 +90,11 @@ std::string applyCompileWorkarounds(int32_t maxBatchSize);
 std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetworkDefinition>> createBuilderAndNetwork();
 
 //! Create TensorRT builder config with optimized settings.
+//! EDGELLM_BUILDER_OPT_LEVEL (integer 0-5) overrides TensorRT's builder optimization level; unset keeps
+//! TensorRT's default.
 //! @param builder TensorRT builder object
-//! @return Builder config with monitor memory flag enabled (TRT >= 10.6)
+//! @return Builder config with monitor memory flag enabled (TRT >= 10.6), or nullptr on failure or an invalid
+//!         EDGELLM_BUILDER_OPT_LEVEL
 std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder* builder);
 
 //! Parse ONNX model and create parser.

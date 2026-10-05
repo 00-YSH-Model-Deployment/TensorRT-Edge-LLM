@@ -295,6 +295,13 @@ bool LLMBuilder::build()
         return false;
     }
 
+    if (mBuilderConfig.optInputLen < 0 || mBuilderConfig.optInputLen > mBuilderConfig.maxInputLen)
+    {
+        LOG_ERROR("optInputLen=%ld must be in [1, maxInputLen=%ld], or 0 for maxInputLen / 2.",
+            mBuilderConfig.optInputLen, mBuilderConfig.maxInputLen);
+        return false;
+    }
+
     int64_t const minimumActivePages
         = rt::computeMinimumKvPoolPages(mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity);
     int64_t const kvPoolPages = mBuilderConfig.resolvedKVPoolPages();
@@ -868,7 +875,7 @@ bool LLMBuilder::setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& 
     bool result = true;
 
     int64_t const maxCanvasLen = std::max<int64_t>(1, std::max(mDiffusionCanvasLength, mBuilderConfig.maxInputLen));
-    int64_t const optPromptLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2);
+    int64_t const optPromptLen = contextOptInputLen();
 
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, optPromptLen, mHiddenSize}),
@@ -925,7 +932,7 @@ bool LLMBuilder::setupVanillaProfiles(
 
     // Input embeddings - always dynamic
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, contextOptInputLen(), mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
@@ -934,7 +941,7 @@ bool LLMBuilder::setupVanillaProfiles(
     if (mModelConfig.value("use_vision_bidirectional_attention", false))
     {
         result &= setOptimizationProfile(&contextProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, contextOptInputLen()}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
         // Decode ignores block IDs, but the static engine binding remains present.
         result &= setOptimizationProfile(&generationProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
@@ -955,6 +962,12 @@ int64_t LLMBuilder::effectiveOptTokens(int64_t maxToken) const
     return std::max<int64_t>(1, maxToken);
 }
 
+int64_t LLMBuilder::contextOptInputLen() const
+{
+    return mBuilderConfig.optInputLen > 0 ? mBuilderConfig.optInputLen
+                                          : std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2);
+}
+
 bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
@@ -965,7 +978,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
 
     // Input embeddings
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, contextOptInputLen(), mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
@@ -982,7 +995,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
         // Hidden states from draft
         result &= setOptimizationProfile(&contextProfile, binding_names::kDraftModelHiddenStates,
             createDims({1, 1, mHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, contextOptInputLen(), mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kDraftModelHiddenStates,
             createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
@@ -991,7 +1004,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
         // Hidden states input
         result &= setOptimizationProfile(&contextProfile, binding_names::kBaseModelHiddenStates,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, contextOptInputLen(), mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mTargetModelOutputHiddenDim}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kBaseModelHiddenStates,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
@@ -1028,7 +1041,7 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
     int64_t const optDraftTokens = maxDraftTokens;
     int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
-    int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
+    int64_t const optPrefillTargetHiddenLen = contextOptInputLen();
     // DFlash verifies [anchor] + proposal tokens and can accept the base
     // bonus token, so the next draft round may need one more target-hidden row
     // than the proposal block.
@@ -1178,7 +1191,7 @@ bool LLMBuilder::setupDSparkDraftProfiles(
     int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
     int64_t const optDraftTokens = maxDraftTokens;
     int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
-    int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
+    int64_t const optPrefillTargetHiddenLen = contextOptInputLen();
     // DSpark verifies [anchor] + proposal tokens and can accept the base bonus token,
     // so the next draft round may need one more target-hidden row than the proposal block.
     int64_t const maxDecodeTargetHiddenLen = maxDraftTokens + 1;
@@ -1280,8 +1293,7 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
 
         int64_t const pleHiddenSize = inputDims.d[2];
         result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
-            createDims(
-                {mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, contextOptInputLen(), pleHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
 
         if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
@@ -1344,7 +1356,7 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
 
         // Same profile as inputs_embeds
         result &= setOptimizationProfile(&contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, contextOptInputLen(), mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
 
         if (mBuilderConfig.specBase || mBuilderConfig.specDraft)
