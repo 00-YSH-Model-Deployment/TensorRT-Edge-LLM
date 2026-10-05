@@ -28,6 +28,7 @@ merger. Qwen3.5-VL is the same but without deepstack_visual_indexes.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -122,9 +123,33 @@ class LayerNorm(nn.Module):
 # Qwen3-VL Visual Model
 # ---------------------------------------------------------------------------
 
+PATCH_EMBED_ENV = "EDGELLM_QWEN3VL_PATCH_EMBED"
+_PATCH_EMBED_MODES = ("conv3d", "linear", "fold")
+
+
+def patch_embed_mode() -> str:
+    """Patch-embed export form selected by ``EDGELLM_QWEN3VL_PATCH_EMBED``.
+
+    ``conv3d`` (default) keeps the checkpoint's Conv3d. ``linear`` exports
+    the same dot products as one GEMM over the flattened patch row (input
+    unchanged). ``fold`` also sums the weights over the temporal taps, so an
+    input row holds a single frame: exact for still images, which HF repeats
+    ``temporal_patch_size`` times, and unusable for multi-frame video.
+    """
+    mode = os.environ.get(PATCH_EMBED_ENV, "").strip().lower() or "conv3d"
+    if mode not in _PATCH_EMBED_MODES:
+        raise ValueError(f"{PATCH_EMBED_ENV}={mode!r}; expected one of "
+                         f"{', '.join(_PATCH_EMBED_MODES)}")
+    return mode
+
 
 class Qwen3VLPatchEmbed(nn.Module):
-    """Conv3d patch embedding (temporal_patch_size, patch_size, patch_size)."""
+    """Conv3d patch embedding (temporal_patch_size, patch_size, patch_size).
+
+    Kernel equals stride, so each output row is one dot product with the
+    flattened ``(C, T, P, P)`` patch row; :meth:`to_linear` swaps the loaded
+    Conv3d for the equivalent ``nn.Linear``.
+    """
 
     def __init__(self,
                  in_channels: int,
@@ -137,6 +162,7 @@ class Qwen3VLPatchEmbed(nn.Module):
         self.hidden_size = hidden_size
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
+        self.temporal_folded = False
         kernel = [temporal_patch_size, patch_size, patch_size]
         self.proj = nn.Conv3d(in_channels,
                               hidden_size,
@@ -144,8 +170,45 @@ class Qwen3VLPatchEmbed(nn.Module):
                               stride=kernel,
                               bias=bias)
 
+    @property
+    def input_dim(self) -> int:
+        """Values per input row: ``C * T * P * P``, or ``C * P * P`` folded."""
+        frames = 1 if self.temporal_folded else self.temporal_patch_size
+        return self.in_channels * frames * self.patch_size * self.patch_size
+
+    @torch.no_grad()
+    def to_linear(self, fold_temporal: bool = False) -> None:
+        """Replace the loaded Conv3d with the Linear computing the same rows.
+
+        With ``fold_temporal`` the weight is ``sum_t W[:, :, t]``, which equals
+        the Conv3d only when every temporal tap of a row sees the same frame.
+        The sum runs in at least FP32 and is rounded once to the weight dtype.
+        """
+        conv = self.proj
+        if not isinstance(conv, nn.Conv3d):
+            raise RuntimeError("Qwen3VLPatchEmbed.to_linear() called twice")
+        weight = conv.weight.to(
+            torch.promote_types(conv.weight.dtype, torch.float32))
+        if fold_temporal:
+            weight = weight.sum(dim=2)
+        weight = weight.reshape(self.hidden_size, -1)
+        linear = nn.Linear(weight.shape[1],
+                           self.hidden_size,
+                           bias=conv.bias is not None,
+                           device=conv.weight.device,
+                           dtype=conv.weight.dtype)
+        linear.weight.copy_(weight)
+        if conv.bias is not None:
+            linear.bias.copy_(conv.bias)
+        linear.requires_grad_(False)
+        self.proj = linear
+        self.temporal_folded = fold_temporal
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
+        if isinstance(self.proj, nn.Linear):
+            return self.proj(
+                hidden_states.view(-1, self.input_dim).to(dtype=target_dtype))
         hidden_states = hidden_states.view(-1, self.in_channels,
                                            self.temporal_patch_size,
                                            self.patch_size, self.patch_size)
@@ -540,14 +603,10 @@ class Qwen3VLVisualModel(nn.Module):
 
     def get_onnx_export_args(self, config: dict, device: str):
         """Return (dynamo_inputs, onnx_input_names, output_names, dynamic_shapes) for ONNX export."""
-        patch_size = config["patch_size"]
-        temporal = config.get("temporal_patch_size", 2)
         num_patches = 256
 
-        in_channels = config.get("in_channels",
-                                 3) * temporal * patch_size * patch_size
         pixel_values = torch.zeros(num_patches,
-                                   in_channels,
+                                   self.patch_embed.input_dim,
                                    dtype=torch.float16,
                                    device=device)
         rotary_pos_emb = torch.zeros(num_patches,
@@ -643,8 +702,16 @@ def build_qwen3_vl_visual(
     model = Qwen3VLVisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_weights(model, weights, prefix="model.visual")
+    apply_patch_embed_mode(model)
     model.eval()
     return model
+
+
+def apply_patch_embed_mode(model: Qwen3VLVisualModel) -> None:
+    """Convert the loaded patch embed as :func:`patch_embed_mode` selects."""
+    mode = patch_embed_mode()
+    if mode != "conv3d":
+        model.patch_embed.to_linear(fold_temporal=mode == "fold")
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +747,8 @@ __all__ = [
     "Qwen3VLPatchMerger",
     "Qwen3VLVisualModel",
     "build_qwen3_vl_visual",
+    "apply_patch_embed_mode",
+    "patch_embed_mode",
     "_load_weights",
     "apply_rotary_pos_emb_vision",
     "RMSNorm",

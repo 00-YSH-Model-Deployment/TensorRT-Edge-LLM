@@ -187,6 +187,17 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     mConfig.maxNumImages
         = mVisualEngine->getProfileShape(binding_names::kCuSeqlens, 0, nvinfer1::OptProfileSelector::kMAX).d[0] - 1;
     mConfig.inputDim = mVisualContext->getTensorShape(binding_names::kVisualInput).d[1];
+    mConfig.temporalPatchFolded = jsonConfig.value("temporal_patch_folded", false);
+    if (mConfig.temporalPatchFolded)
+    {
+        int64_t const rowDim = static_cast<int64_t>(mConfig.imageMean.size()) * mConfig.patchSize * mConfig.patchSize;
+        if (mConfig.inputDim != rowDim)
+        {
+            LOG_ERROR("temporal_patch_folded visual engine must take %ld values per patch row, got %ld", rowDim,
+                mConfig.inputDim);
+            return false;
+        }
+    }
     // Whether the ViT consumes a rotary_pos_emb input is a fixed per-model property (see usesRotaryPosEmb),
     // not something to read off the engine. Take it from that hook and validate the loaded engine agrees.
     mHasRotaryPosEmb = usesRotaryPosEmb();
@@ -352,8 +363,10 @@ void QwenViTRunner::formatPatch(
     patchBase += totalSeqLen;
 
     // Physical frames consumed = grid_t groups * temporalPatchSize (HF pads T to a multiple of temporalPatchSize).
+    // A temporally folded engine sees each group's (single, repeated) frame once.
+    int64_t const framesPerGroup = mConfig.temporalPatchFolded ? 1 : mConfig.temporalPatchSize;
     int64_t const nSourceFrames = image.frames;
-    int64_t const tPadded = totalGridT * mConfig.temporalPatchSize;
+    int64_t const tPadded = totalGridT * framesPerGroup;
 
     check::check(mImageDevice.reshape({tPadded, height, width, channels}), "Tensor reshape failed");
     check::check(mNormalizedImageDevice.reshape({tPadded, height, width, channels}), "Tensor reshape failed");
@@ -369,8 +382,8 @@ void QwenViTRunner::formatPatch(
     }
 
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
-    kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevPatchBase * mConfig.inputDim,
-        mConfig.temporalPatchSize, mConfig.patchSize, mConfig.mergeSize, stream);
+    kernel::transposeToPatchQwenViT(mNormalizedImageDevice, mVitInput, prevPatchBase * mConfig.inputDim, framesPerGroup,
+        mConfig.patchSize, mConfig.mergeSize, stream);
 }
 
 void QwenViTRunner::buildCuSeqlens(
@@ -447,6 +460,10 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std
         size_t const spansBefore = spans.size();
         for (auto const& image : req.imageBuffers)
         {
+            // Folding W[:, :, t] into one weight is exact only when every temporal tap sees the same frame.
+            ELLM_CHECK(!mConfig.temporalPatchFolded || image.frames == 1,
+                "Visual engine has temporal_patch_folded (still images only) but got a buffer with "
+                    + std::to_string(image.frames) + " frames; re-export without EDGELLM_QWEN3VL_PATCH_EMBED=fold.");
             if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth]

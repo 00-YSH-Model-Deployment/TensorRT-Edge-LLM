@@ -1828,7 +1828,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 output_path)
     try:
         from ..onnx.export_encoder import export_visual_onnx
-        export_visual_onnx(
+        runtime_fields = export_visual_onnx(
             model_dir=model_dir,
             output_path=output_path,
             weights=weights,
@@ -2105,6 +2105,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             config, "video_target_num_patches", 1024)
         vis_cfg_out["video_maintain_aspect_ratio"] = resolve_video_cfg(
             config, "video_maintain_aspect_ratio", True)
+    vis_cfg_out.update(runtime_fields)
     if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
         vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")

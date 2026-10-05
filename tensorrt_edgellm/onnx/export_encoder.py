@@ -291,7 +291,7 @@ def export_visual_onnx(
     model_type: str,
     model_config: "ModelConfig",
     dtype: torch.dtype = torch.float16,
-) -> None:
+) -> dict:
     """Export a from-scratch visual encoder to ONNX.
 
     Args:
@@ -306,6 +306,10 @@ def export_visual_onnx(
                       ``make_linear``; an FP16 checkpoint produces
                       ``FP16Linear`` everywhere.
         dtype:        Weight dtype (default ``float16``).
+
+    Returns:
+        Fields the visual ``config.json`` must carry for the C++ runtime to
+        feed this graph (empty unless the input layout departs from HF's).
     """
     device = "cpu"
     if model_type not in _VISUAL_REGISTRY:
@@ -371,6 +375,12 @@ def export_visual_onnx(
         sidecar_path = visual_model.save_onnx_sidecar(
             os.path.dirname(os.path.abspath(output_path)))
         logger.info("Saved Nemotron-Omni embedder sidecar: %s", sidecar_path)
+
+    runtime_fields: dict = {}
+    if getattr(getattr(visual_model, "patch_embed", None), "temporal_folded",
+               False):
+        runtime_fields["temporal_patch_folded"] = True
+    return runtime_fields
 
 
 # ---------------------------------------------------------------------------

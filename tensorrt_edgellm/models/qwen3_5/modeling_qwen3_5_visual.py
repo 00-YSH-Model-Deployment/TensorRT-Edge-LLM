@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..qwen3_vl.modeling_qwen3_vl_visual import (Qwen3VLVisualModel,
-                                                 _load_weights)
+                                                 _load_weights,
+                                                 apply_patch_embed_mode)
 
 if TYPE_CHECKING:
     from ...config import ModelConfig
@@ -60,6 +61,7 @@ def build_qwen3_5_visual(
     model = Qwen3_5VLVisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_weights(model, weights, prefix="model.visual")
+    apply_patch_embed_mode(model)
     model.eval()
     return model
 
