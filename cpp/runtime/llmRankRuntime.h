@@ -348,6 +348,7 @@ private:
     struct StreamingPrefillState
     {
         bool enabled{false};
+        bool rerotate{true}; //!< EDGELLM_STREAMING_REROTATE: moved keys take their new row's rotary position
         int32_t framesPerView{4};
         bool valid{false};                                 //!< The slot-0 KV holds the prompt below
         std::vector<int32_t> promptIds;                    //!< Prompt whose KV is resident

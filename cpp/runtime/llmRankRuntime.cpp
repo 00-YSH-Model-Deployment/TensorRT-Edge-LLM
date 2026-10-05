@@ -28,6 +28,7 @@
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include "kernels/posEncoding/rerotateKCache.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "multimodal/common/multimodalRunner.h"
 #include "multimodal/qwen2/qwenViTRunner.h"
@@ -623,8 +624,12 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     if (char const* streaming = std::getenv("EDGELLM_STREAMING_PREFILL"))
     {
         mStreaming.enabled = std::atoi(streaming) != 0 && !contextCacheConfig.enabled;
-        LOG_INFO("Streaming prefill %s (%d frames per camera)", mStreaming.enabled ? "on" : "off",
-            mStreaming.framesPerView);
+        if (char const* rerotate = std::getenv("EDGELLM_STREAMING_REROTATE"))
+        {
+            mStreaming.rerotate = std::atoi(rerotate) != 0;
+        }
+        LOG_INFO("Streaming prefill %s (%d frames per camera, moved keys %s)", mStreaming.enabled ? "on" : "off",
+            mStreaming.framesPerView, mStreaming.rerotate ? "re-rotated" : "keep their old rotation");
     }
     if (char const* temporal = std::getenv("EDGELLM_TEMPORAL_DRAFT"))
     {
@@ -3058,7 +3063,31 @@ bool LLMRankRuntime::runStreamingPrefill(DecodingInferenceContext& context)
 
     // Batch 1 on the identity page table: slot 0's tokens are contiguous rows of each layer's K half and V half.
     // Move each camera's frame k+1 block into frame k's slot for k = 0..n-2 in order, so a source is always read
-    // before it is overwritten. Keys keep the rotation of their old slot, as in FlashDrive's index_copy.
+    // before it is overwritten. This cache holds post-RoPE keys (FlashDrive caches pre-RoPE keys and ropes them
+    // per call, so its moves need no fix): a moved key still carries its old row's position unless re-rotated to
+    // the new row's, which the current prompt's cos/sin table holds for both rows since the layout is unchanged.
+    kernel::KRerotateSegments moved;
+    int32_t maxMoved = 0;
+    if (mStreaming.rerotate)
+    {
+        ELLM_CHECK(
+            kvConfig.kvCacheType == nvinfer1::DataType::kHALF && mDeployment.base.ropeConfig.type == RopeType::kMRope,
+            "Re-rotating moved keys needs an FP16 KV cache and M-RoPE; set EDGELLM_STREAMING_REROTATE=0 otherwise.");
+        for (int32_t v = 0; v < views; ++v)
+        {
+            for (int32_t k = 0; k + 1 < n; ++k)
+            {
+                auto const& dst = frames[static_cast<size_t>(v * n + k)];
+                auto const& src = frames[static_cast<size_t>(v * n + k + 1)];
+                ELLM_CHECK(moved.count < kernel::KRerotateSegments::kMaxSegments, "Too many moved frame blocks.");
+                moved.dst[moved.count] = dst.first;
+                moved.src[moved.count] = src.first;
+                moved.len[moved.count] = src.second - src.first;
+                maxMoved = std::max(maxMoved, src.second - src.first);
+                ++moved.count;
+            }
+        }
+    }
     for (int32_t layer = 0; layer < kvConfig.numAttentionLayers; ++layer)
     {
         auto const& lc = kvConfig.layerConfigs[static_cast<size_t>(layer)];
@@ -3078,6 +3107,11 @@ bool LLMRankRuntime::runStreamingPrefill(DecodingInferenceContext& context)
                         context.stream));
                 }
             }
+        }
+        if (mStreaming.rerotate)
+        {
+            kernel::launchRerotateKCache(reinterpret_cast<half*>(pool), mPipelineIO->mropeCosSin.dataPointer<float>(),
+                mDeployment.base.rotaryDim, lc.numKVHeads, lc.headDim, moved, maxMoved, context.stream);
         }
     }
 
