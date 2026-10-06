@@ -1841,7 +1841,20 @@ bool LLMRankRuntime::handleRequest(LLMGenerationRequest const& request, LLMGener
         check::check(totalLength >= genLength, "Total length should be greater than or equal to generated length");
         response.outputIds[originalIdx] = std::vector<int32_t>(
             batchResult.tokenIds.begin() + (totalLength - genLength), batchResult.tokenIds.end());
-        response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
+        auto const& outputIds = response.outputIds[originalIdx];
+        auto textEnd = outputIds.end();
+        // The token after <|traj_future_start|> is the LLM's next prediction, outside the KV the action head reads.
+        // It is not reasoning text: a reduced-vocabulary lm_head cannot predict a trajectory token there.
+        if (hasActionRequest && originalIdx < static_cast<int32_t>(request.requests.size())
+            && request.requests[originalIdx].pastTrajectory.has_value())
+        {
+            textEnd = std::find(outputIds.begin(), outputIds.end(), trajFutureStartId);
+            if (textEnd != outputIds.end())
+            {
+                ++textEnd;
+            }
+        }
+        response.outputTexts[originalIdx] = mTokenizer->decode(std::vector<int32_t>(outputIds.begin(), textEnd), true);
         response.logprobs[originalIdx] = batchResult.logprobs;
         response.finishReasons[originalIdx] = batchResult.terminalReason;
         // Prompt length after chat templating and media expansion (OpenAI usage).
