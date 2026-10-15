@@ -196,6 +196,14 @@ def _promote_alpamayo_llm_config(root: Dict[str, Any]) -> Dict[str, Any]:
     # or language_config.  Promote it using the existing helper.
     llm = _promote_llm_subconfig(vlm_cfg, vlm_dict)
 
+    # A width-pruned student embeds its own VLM config (e.g. a smaller
+    # intermediate_size); vlm_name_or_path describes the unpruned backbone.
+    embedded = root.get("vlm_config")
+    if isinstance(embedded, dict):
+        for key, value in embedded.get("text_config", embedded).items():
+            if key != "vocab_size" and key in llm and not isinstance(value, dict):
+                llm[key] = value
+
     # Alpamayo extends the vocabulary with trajectory tokens; the root
     # config carries the true vocab_size which must override the base VLM's.
     if root.get("vocab_size") is not None:
