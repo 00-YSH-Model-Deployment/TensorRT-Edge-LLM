@@ -46,6 +46,10 @@ VisualTokenPruner::VisualTokenPruner(VisualPrunerConfig const& config, LLMEngine
     , mMaxKVCacheCapacity(engineConfig.maxKVCacheCapacity)
 {
     check::check(mConfig.reductionRatio > 0.0F && mConfig.reductionRatio < 1.0F, "reductionRatio must be in (0, 1)");
+    for (float const keep : mConfig.keepRatioPerImage)
+    {
+        check::check(keep > 0.0F && keep <= 1.0F, "keepRatioPerImage entries must be in (0, 1]");
+    }
     check::check(mImageTokenId >= 0, "visual-token pruning requires a VLM engine with an image token id");
 
     int32_t const maxInputLen = engineConfig.maxSupportedInputLength;
@@ -94,8 +98,7 @@ int32_t VisualTokenPruner::pruneForPrefill(
             ++j;
         }
         int32_t const spanLen = static_cast<int32_t>(j - i);
-        int32_t target = static_cast<int32_t>(std::ceil(static_cast<double>(spanLen) * (1.0 - mConfig.reductionRatio)));
-        target = std::max(1, std::min(spanLen, target));
+        int32_t const target = std::max(1, std::min(spanLen, spanTarget(mImageSpans.size(), spanLen)));
         mImageSpans.push_back({mImagePositions[i], mImagePositions[j - 1] + 1, target});
         targetImageTokens += target;
         i = j;
@@ -119,6 +122,71 @@ int32_t VisualTokenPruner::pruneForPrefill(
     check::check(prunedLen > 0 && prunedLen <= origLen, "pruner returned an invalid pruned length");
     return prunedLen;
 }
+
+int32_t VisualTokenPruner::spanTarget(size_t spanIndex, int32_t spanLen) const
+{
+    double const keep = mConfig.keepRatioPerImage.empty()
+        ? 1.0 - mConfig.reductionRatio
+        : mConfig.keepRatioPerImage[spanIndex % mConfig.keepRatioPerImage.size()];
+    return static_cast<int32_t>(std::ceil(static_cast<double>(spanLen) * keep));
+}
+
+namespace
+{
+
+//! Drops fixed token columns per image (merged-token grid, row-major), keeping the rest in place.
+class ColumnPruner final : public VisualTokenPruner
+{
+public:
+    ColumnPruner(VisualPrunerConfig const& config, LLMEngineConfig const& engineConfig)
+        : VisualTokenPruner(config, engineConfig)
+    {
+        check::check(config.gridWidth > 0 && !config.dropColumnsPerImage.empty(),
+            "columns pruner needs gridWidth and dropColumnsPerImage");
+    }
+    char const* name() const noexcept override
+    {
+        return "columns";
+    }
+
+protected:
+    int32_t spanTarget(size_t spanIndex, int32_t spanLen) const override
+    {
+        int32_t kept = 0;
+        for (int32_t k = 0; k < spanLen; ++k)
+        {
+            kept += keepToken(spanIndex, k) ? 1 : 0;
+        }
+        return kept;
+    }
+    int32_t prune(PruneRequest const& req, PipelineIO& io, cudaStream_t stream) override
+    {
+        mRetained.clear();
+        for (size_t s = 0; s < req.imageSpans->size(); ++s)
+        {
+            ImageSpan const& span = (*req.imageSpans)[s];
+            for (int32_t k = 0; k < span.end - span.begin; ++k)
+            {
+                if (keepToken(s, k))
+                {
+                    mRetained.push_back(span.begin + k);
+                }
+            }
+        }
+        return compactToKeepList(io, mRetained, req, stream);
+    }
+
+private:
+    bool keepToken(size_t spanIndex, int32_t k) const
+    {
+        auto const& [lo, hi] = config().dropColumnsPerImage[spanIndex % config().dropColumnsPerImage.size()];
+        int32_t const col = k % config().gridWidth;
+        return col < lo || col > hi;
+    }
+    std::vector<int32_t> mRetained;
+};
+
+} // namespace
 
 int32_t VisualTokenPruner::compactToKeepList(
     PipelineIO& io, std::vector<int32_t> const& retainedImageIndices, PruneRequest const& req, cudaStream_t stream)
@@ -220,6 +288,10 @@ std::map<std::string, VisualPrunerFactory>& prunerRegistry()
         {"dart",
             [](VisualPrunerConfig const& cfg, LLMEngineConfig const& engineCfg) {
                 return std::unique_ptr<VisualTokenPruner>(std::make_unique<DartPruner>(cfg, engineCfg));
+            }},
+        {"columns",
+            [](VisualPrunerConfig const& cfg, LLMEngineConfig const& engineCfg) {
+                return std::unique_ptr<VisualTokenPruner>(std::make_unique<ColumnPruner>(cfg, engineCfg));
             }},
     };
     return registry;

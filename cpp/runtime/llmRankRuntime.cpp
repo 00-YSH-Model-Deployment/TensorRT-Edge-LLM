@@ -872,12 +872,12 @@ void LLMRankRuntime::setVisualPrunerConfig(VisualPrunerConfig const& config)
         LOG_WARNING("Visual-token pruning requires an mRoPE VLM engine (image token id present); leaving it disabled.");
         return;
     }
-    if (mDeployment.specConfig.has_value())
+    if (mDeployment.specConfig.has_value() && !config.allowSpecAndAction)
     {
         LOG_WARNING("Visual-token pruning is not supported together with speculative decoding; leaving it disabled.");
         return;
     }
-    if (mActionRunner)
+    if (mActionRunner && !config.allowSpecAndAction)
     {
         LOG_WARNING("Visual-token pruning is not supported together with an action runner; leaving it disabled.");
         return;
@@ -2885,6 +2885,12 @@ bool LLMRankRuntime::runBaseModelPrefill(
                 inputIdsLength, prunedLen);
             context.prunedPrefillTokens.assign(context.effectivePrefillLengths.size(), 0);
             context.prunedPrefillTokens[0] = inputIdsLength - prunedLen;
+            if (mActionRunner)
+            {
+                // Kept tokens hold their original positions, so the expert's first position is the unpruned
+                // length plus the vision delta; the collector adds its delta to the shorter KV length.
+                mActionKvBatchCollector->offsetMropeDelta(0, inputIdsLength - prunedLen);
+            }
             context.effectivePrefillLengths[0] = prunedLen;
             hostCtxLenData[0] = prunedLen;
             inputIdsLength = prunedLen;

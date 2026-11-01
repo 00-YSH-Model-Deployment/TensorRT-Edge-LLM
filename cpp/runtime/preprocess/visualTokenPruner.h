@@ -26,6 +26,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace trt_edgellm
@@ -47,6 +48,17 @@ struct VisualPrunerConfig
     //! Skip pruning when the request has fewer visual tokens than this (accuracy and
     //! break-even guard: tiny images gain nothing from pruning).
     int32_t minVisualTokens{16};
+    //! Keep ratio per image, cycled over consecutive images in prompt order (e.g. one camera's frames,
+    //! oldest first). Overrides reductionRatio when non-empty; each entry is in (0, 1].
+    std::vector<float> keepRatioPerImage;
+    //! Allow pruning with speculative decoding and an action runner. Both read positions through the
+    //! compacted mRoPE table; the action runner's mRoPE delta must be offset by the pruned count.
+    bool allowSpecAndAction{false};
+
+    // --- "columns" (geometric) pruner: drops fixed token columns, e.g. a camera's field of view that another
+    // camera already covers. Entry i applies to image i in prompt order, cycled; {-1, -1} keeps the image.
+    int32_t gridWidth{0}; //!< Merged-token columns per image row.
+    std::vector<std::pair<int32_t, int32_t>> dropColumnsPerImage; //!< Inclusive column range to drop.
 
     // --- DART-specific parameters (ignored by other pruners) ---
     int32_t pivotImageTokens{4};
@@ -135,6 +147,9 @@ protected:
     //! PipelineIO buffers (e.g. token merging), upholding the compaction invariants described
     //! on the class. Return the pruned length, or req.origLen to skip pruning this request.
     virtual int32_t prune(PruneRequest const& req, PipelineIO& io, cudaStream_t stream) = 0;
+
+    //! Visual tokens to retain from span `spanIndex` of length `spanLen`; the default follows the keep ratios.
+    virtual int32_t spanTarget(size_t spanIndex, int32_t spanLen) const;
 
     //! Shared compaction for subset-selection algorithms: keep all text tokens plus
     //! `retainedImageIndices` (any order, no duplicates, subset of *req.imagePositions),

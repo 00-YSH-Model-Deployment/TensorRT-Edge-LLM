@@ -39,6 +39,12 @@ ActionKvBatchCollector::ActionKvBatchCollector(int32_t maxBatch, int32_t maxPage
     ELLM_CHECK(maxBatch > 0, "Action KV snapshot capacity must be positive");
 }
 
+void ActionKvBatchCollector::offsetMropeDelta(size_t requestIndex, int64_t offset)
+{
+    ELLM_CHECK(requestIndex < mRequestMropeDeltas.size(), "Action KV snapshot request index out of range");
+    mRequestMropeDeltas[requestIndex] += offset;
+}
+
 void ActionKvBatchCollector::beginRequest(std::vector<bool> const& actionSlots, std::vector<int64_t> const& mropeDeltas)
 {
     ELLM_CHECK(static_cast<int32_t>(actionSlots.size()) <= mMaxBatch,

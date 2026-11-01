@@ -31,6 +31,7 @@
 #include <getopt.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -633,6 +634,39 @@ int main(int argc, char* argv[])
     if (!llmInferenceRuntime->captureDecodingCUDAGraph(stream))
     {
         LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+    }
+    // EDGELLM_VISUAL_PRUNE_KEEP=<r0,r1,...> prunes visual tokens before prefill (DART), keeping fraction r_i of
+    // image i in prompt order, cycled; e.g. 0.5,0.5,0.5,1 keeps each camera's newest of four frames whole.
+    if (char const* keep = std::getenv("EDGELLM_VISUAL_PRUNE_KEEP"))
+    {
+        rt::VisualPrunerConfig pruneConfig;
+        pruneConfig.enabled = true;
+        pruneConfig.allowSpecAndAction = true;
+        std::stringstream ss(keep);
+        for (std::string item; std::getline(ss, item, ',');)
+        {
+            pruneConfig.keepRatioPerImage.push_back(std::stof(item));
+        }
+        llmInferenceRuntime->setVisualPrunerConfig(pruneConfig);
+    }
+    // EDGELLM_VISUAL_PRUNE_COLUMNS=<lo-hi|->,... drops merged-token columns lo..hi of image i in prompt order
+    // (cycled; "-" keeps the image), on a grid EDGELLM_VISUAL_PRUNE_GRID_W columns wide (default 18 = 576 px).
+    else if (char const* cols = std::getenv("EDGELLM_VISUAL_PRUNE_COLUMNS"))
+    {
+        rt::VisualPrunerConfig pruneConfig;
+        pruneConfig.enabled = true;
+        pruneConfig.allowSpecAndAction = true;
+        pruneConfig.algorithm = "columns";
+        char const* gridW = std::getenv("EDGELLM_VISUAL_PRUNE_GRID_W");
+        pruneConfig.gridWidth = gridW != nullptr ? std::atoi(gridW) : 18;
+        std::stringstream ss(cols);
+        for (std::string item; std::getline(ss, item, ',');)
+        {
+            auto const dash = item.find('-', 1);
+            pruneConfig.dropColumnsPerImage.emplace_back(item == "-" ? std::make_pair(-1, -1)
+                    : std::make_pair(std::stoi(item.substr(0, dash)), std::stoi(item.substr(dash + 1))));
+        }
+        llmInferenceRuntime->setVisualPrunerConfig(pruneConfig);
     }
     LOG_INFO("Using noise seed %d for action diffusion trajectory", args.noiseSeed);
     llmInferenceRuntime->setActionNoiseSeed(args.noiseSeed);

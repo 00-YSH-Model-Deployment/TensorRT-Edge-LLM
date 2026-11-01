@@ -46,6 +46,8 @@ public:
     ActionKvBatchCollector(int32_t maxBatch, int32_t maxPagesPerSeq, int32_t numPages);
 
     void beginRequest(std::vector<bool> const& actionSlots, std::vector<int64_t> const& mropeDeltas);
+    //! Shift one request's mRoPE delta, e.g. by the visual tokens pruned from its prefill.
+    void offsetMropeDelta(size_t requestIndex, int64_t offset);
     void captureFinished(KVPageTable const& pageTable, Tensor const& deviceKvLengths,
         std::vector<int8_t> const& finished, std::vector<int32_t> const& originalIndices, cudaStream_t stream);
     //! Consume queued length copies after the caller has synchronized the enqueue stream.
